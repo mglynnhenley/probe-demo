@@ -1,0 +1,59 @@
+# Default training config for probe-demo (policy-violation probe via vLLM hidden states).
+# Copy or edit paths and hyperparameters for your runs.
+
+# ── Model / vLLM ───────────────────────────────────────────────────────────
+# Hugging Face model id or local path passed to vLLM.
+model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
+
+# null or "auto" = pick float16 vs bfloat16 from GPU compute capability (when CUDA is available)
+dtype: auto
+
+max_model_len: 4096
+gpu_memory_utilization: 0.75
+
+# Tensor parallel width this model needs; script pairs with available GPUs → (tp, dp)
+tensor_parallel_size: 1
+
+# Layer index whose hidden states the probe reads (must match plugin / training code).
+layer_idx: 30
+
+trust_remote_code: true
+
+# Optional LoRA (vLLM); probe training does not update LoRA weights
+lora_present: false
+lora_path: output/lora_adapter/
+
+# ── Probe head ─────────────────────────────────────────────────────────────
+# Must match the base model hidden size (e.g. 4096 for Llama 3.1 8B).
+hidden_size: 4096
+
+# Empty list = linear probe; e.g. [1024] for one hidden MLP layer
+probe_hidden_sizes: []
+
+# ── Data ───────────────────────────────────────────────────────────────────
+# JSONL from annotation_pipeline (see annotation_pipeline/README.md).
+annotations_jsonl: data/annotated.jsonl
+
+val_fraction: 0.1
+
+# Rare positive class (violations): use "auto" for BCE pos_weight = n_nonviol / n_viol on train
+pos_weight: auto
+# Optional cap on auto pos_weight if ratio is extreme (null = no cap)
+pos_weight_max: null
+
+# ── Training ───────────────────────────────────────────────────────────────
+epochs: 3
+train_batch_size: 1
+grad_accumulation_steps: 1
+probe_lr: 1.0e-3
+warmup_steps: 50
+max_grad_norm: 1.0
+
+val_interval: 500
+log_interval: 1
+checkpoint_interval: 100
+
+# ── Output ─────────────────────────────────────────────────────────────────
+output_dir: output/probe_run
+
+seed: 42

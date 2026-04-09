@@ -1,5 +1,23 @@
-.env
-__pycache__/
-*.pyc
+# environment
 .venv/
+
+# environment variables
+.env
+.env.*
+!.env.example
+
+# ruff
+.ruff_cache/
+
+# MacOS files
+.DS_Store
+
+# Visual Studio Code
+.vscode/
+
+# Python cache
+__pycache__/
+*.egg-info/
+
+# backups
 backups/
