@@ -1,0 +1,55 @@
+# Profile: google/gemma-4-31B-it on one NVIDIA H200 (~141GB), BF16 weights ~60GB.
+# Prerequisites:
+#   - vLLM build that lists Gemma 4 / this checkpoint (upgrade vLLM if load fails).
+#   - transformers + tokenizer chat template compatible with Gemma 4 (enable_thinking below).
+
+# ── Model / vLLM ───────────────────────────────────────────────────────────
+model_name: google/gemma-4-31B-it
+
+# H200 is Hopper (BF16 tensor cores). Pin BF16 instead of relying on "auto".
+dtype: bfloat16
+
+# Context is 256K on the card, but training uses KV for your max seq length — start conservative.
+max_model_len: 8192
+
+# ~60GB model + KV headroom on 141GB; tune down if OOM.
+gpu_memory_utilization: 0.90
+
+# Single H200: one replica, no tensor parallel unless you shard across GPUs.
+tensor_parallel_size: 1
+
+# Gemma 4 31B dense has 60 layers (indices 0–59). Mid/late layer example:
+layer_idx: 47
+
+trust_remote_code: true
+
+# Gemma 4 IT: disable “thinking” so templates match plain user/assistant completions.
+chat_template_kwargs:
+  enable_thinking: false
+
+lora_present: false
+lora_path: output/lora_adapter/
+
+# ── Probe head (hidden_size is taken from the loaded model in train.py; value below is only a default) ─
+hidden_size: 4096
+probe_hidden_sizes: []
+
+# ── Data ───────────────────────────────────────────────────────────────────
+annotations_jsonl: data/annotated.jsonl
+val_fraction: 0.1
+pos_weight: auto
+pos_weight_max: null
+
+# ── Training ───────────────────────────────────────────────────────────────
+epochs: 3
+train_batch_size: 1
+grad_accumulation_steps: 1
+probe_lr: 1.0e-3
+warmup_steps: 50
+max_grad_norm: 1.0
+val_interval: 500
+log_interval: 1
+checkpoint_interval: 100
+
+output_dir: output/gemma4_31b_probe
+seed: 42
