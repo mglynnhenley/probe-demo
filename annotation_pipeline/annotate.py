@@ -2,16 +2,23 @@
 """
 Annotate completions with policy-violation spans (OpenRouter only).
 
-Reads generations JSONL (policy, question, completion, …), calls an annotator
-model via OpenRouter, and writes JSONL with `annotations` and
-`annotator_model` set. Skips already-annotated IDs (resume-safe).
+Input is either a generations JSONL file or rows from Supabase (table matching
+README columns: id, question, completion, model, source_dataset, policy).
+
+Calls an annotator model via OpenRouter and writes JSONL with ``annotations`` and
+``annotator_model``. Skips any input row whose ``id`` already appears in the
+output file (resume-safe; does not re-call the API for those ids).
 
 Usage:
     export OPENROUTER_API_KEY=...
+    export OPENROUTER_ANNOTATOR_MODEL=openai/gpt-4o-mini   # or pass --model (required)
     python annotation_pipeline/annotate.py \\
         --input data/generations.jsonl \\
-        --output data/annotated.jsonl \\
-        --model anthropic/claude-3.5-sonnet
+        --output data/annotated.jsonl
+
+    # From Supabase (see annotation_pipeline/downloader.py)
+    export SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=...  # or SUPABASE_KEY / anon key
+    python annotation_pipeline/annotate.py --supabase --output data/annotated.jsonl --model openai/gpt-4o-mini
 """
 
 from __future__ import annotations
@@ -36,14 +43,34 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from annotation_pipeline.data_models import GenerationRecord, PolicyViolationSpan
+from annotation_pipeline.downloader import default_generations_table, fetch_generation_records
 
 load_dotenv()
 log = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
-SYSTEM_PROMPT = (_PROMPTS_DIR / "policy_violation.txt").read_text().strip()
+# Single system prompt for policy-span auditing (must match PolicyViolationSpan in data_models.py).
+SYSTEM_PROMPT = (_PROMPTS_DIR / "policy_violation.txt").read_text(encoding="utf-8").strip()
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+def _openrouter_chat_url() -> str:
+    """URL for POST chat completions.
+
+    Same convention as the OpenAI SDK / hallucination-probes-backend ``OPENROUTER_BASE_URL``:
+    ``https://openrouter.ai/api/v1`` is valid; we append ``/chat/completions`` when missing.
+
+    ``OPENROUTER_API_URL`` (full URL) wins over ``OPENROUTER_BASE_URL`` (base only).
+    """
+    explicit = os.environ.get("OPENROUTER_API_URL", "").strip()
+    base = os.environ.get("OPENROUTER_BASE_URL", "").strip()
+    default_full = "https://openrouter.ai/api/v1/chat/completions"
+    raw = explicit or base or default_full
+    raw = raw.rstrip("/")
+    if raw.endswith("/chat/completions"):
+        return raw
+    # OpenAI-style base_url (what AsyncOpenAI(base_url=...) uses for OpenRouter)
+    if raw.endswith("/v1") or raw.endswith("/api/v1"):
+        return f"{raw}/chat/completions"
+    return raw
 
 
 def _format_user_message(policy: str, question: str, completion: str) -> str:
@@ -228,30 +255,70 @@ async def _annotate_openrouter(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    url = _openrouter_chat_url()
     last_err: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
             async with semaphore:
                 resp = await client.post(
-                    OPENROUTER_URL,
+                    url,
                     json=payload,
                     headers={
-                        "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     timeout=120.0,
                 )
                 resp.raise_for_status()
             break
-        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            code = e.response.status_code
+            body_snip = (e.response.text or "")[:400]
+            if code in (401, 403):
+                raise RuntimeError(
+                    f"OpenRouter HTTP {code} for {url!r}. "
+                    "Check OPENROUTER_API_KEY (non-empty, valid). "
+                    f"Body (truncated): {body_snip!r}"
+                ) from e
+            if code == 404:
+                try:
+                    j = json.loads(e.response.text or "{}")
+                    em = (j.get("error") or {}).get("message")
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    em = None
+                if isinstance(em, str) and "No endpoints found" in em:
+                    raise RuntimeError(
+                        f"OpenRouter HTTP 404: {em} "
+                        "That model id is not available on OpenRouter (retired or wrong id). "
+                        "Set --model or OPENROUTER_ANNOTATOR_MODEL to a model from https://openrouter.ai/models"
+                    ) from e
+                raise RuntimeError(
+                    f"OpenRouter HTTP 404 for {url!r}. "
+                    "Check OPENROUTER_BASE_URL / OPENROUTER_API_URL if you override them; "
+                    "a wrong path or a blocking proxy can 404. "
+                    f"Body (truncated): {body_snip!r}"
+                ) from e
+            if 400 <= code < 500 and code != 429:
+                raise RuntimeError(
+                    f"OpenRouter HTTP {code} for {url!r}. Body (truncated): {body_snip!r}"
+                ) from e
+            if code not in (429, 500, 502, 503, 504, 529):
+                raise RuntimeError(
+                    f"OpenRouter HTTP {code} for {url!r}. Body (truncated): {body_snip!r}"
+                ) from e
+            if attempt < max_retries - 1:
+                wait = min(2**attempt, 30)
+                log.warning("Retryable HTTP %s, sleeping %ss", code, wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
+        except httpx.TransportError as e:
             last_err = e
             if attempt < max_retries - 1:
-                wait = 2**attempt
-                code = getattr(e, "response", None) and getattr(e.response, "status_code", None)
-                if code in (429, 502, 503, 529):
-                    log.warning("Retryable error (%s), sleeping %ss", code, wait)
-                else:
-                    log.warning("Request error: %s, sleeping %ss", e, wait)
+                wait = min(2**attempt, 30)
+                log.warning("Transport error: %s, sleeping %ss", e, wait)
                 await asyncio.sleep(wait)
             else:
                 raise
@@ -263,32 +330,51 @@ async def _annotate_openrouter(
     return _assign_positions(spans, completion)
 
 
-def run(
-    input_path: Path,
-    output_path: Path,
-    model: str,
-    max_tokens: int = 8192,
-    temperature: float = 0.0,
-    max_concurrent: int = 3,
-    num_items: Optional[int] = None,
-) -> int:
-    """Annotate completions. Returns number of records written."""
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise SystemExit("OPENROUTER_API_KEY is not set.")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
+def _load_records_from_jsonl(path: Path) -> list[GenerationRecord]:
     records: list[GenerationRecord] = []
-    with open(input_path) as f:
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
                 raw = json.loads(line)
                 raw.pop("logprobs", None)
                 records.append(GenerationRecord.model_validate(raw))
+    return records
+
+
+def run(
+    output_path: Path,
+    model: str,
+    input_path: Optional[Path] = None,
+    from_supabase: bool = False,
+    supabase_table: Optional[str] = None,
+    supabase_limit: Optional[int] = None,
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
+    max_concurrent: int = 3,
+    num_items: Optional[int] = None,
+) -> int:
+    """Annotate completions. Returns number of records written."""
+    if not os.environ.get("OPENROUTER_API_KEY", "").strip():
+        raise SystemExit("OPENROUTER_API_KEY is not set or is empty.")
+
+    if from_supabase:
+        table = supabase_table if supabase_table is not None else default_generations_table()
+        records = fetch_generation_records(table=table, limit=supabase_limit)
+        print(f"Loaded {len(records)} row(s) from Supabase table {table!r}")
+    else:
+        if input_path is None:
+            raise SystemExit("Provide --input PATH.jsonl or use --supabase.")
+        records = _load_records_from_jsonl(input_path)
+
     if num_items is not None:
         records = records[:num_items]
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Any line in the output file with an id counts as done (resume-safe). Do not
+    # require ``annotations`` to be non-null: empty or missing annotations still
+    # mean "this prompt was already processed" for the same id.
     done_ids: set[str] = set()
     if output_path.exists():
         with open(output_path) as f:
@@ -298,12 +384,13 @@ def run(
                     continue
                 try:
                     rec = json.loads(line)
-                    if rec.get("id") and rec.get("annotations") is not None:
-                        done_ids.add(rec["id"])
+                    oid = rec.get("id")
+                    if oid is not None and str(oid).strip():
+                        done_ids.add(str(oid))
                 except json.JSONDecodeError:
                     pass
         if done_ids:
-            log.info("Resuming: %d records already annotated", len(done_ids))
+            log.info("Resuming: %d id(s) already in %s", len(done_ids), output_path)
 
     to_do = [r for r in records if r.id not in done_ids and r.completion]
     print(f"Records to annotate: {len(to_do)}")
@@ -362,12 +449,38 @@ def run(
 
 
 @click.command(context_settings=dict(help_option_names=["-h", "--help"], show_default=True))
-@click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--input",
+    "input_path",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Generations JSONL (README schema). Not used with --supabase.",
+)
+@click.option(
+    "--supabase",
+    is_flag=True,
+    default=False,
+    help="Load generations from Supabase instead of --input (see downloader.py).",
+)
+@click.option(
+    "--table",
+    "supabase_table",
+    default=None,
+    type=str,
+    help="Supabase table name (default: env SUPABASE_GENERATIONS_TABLE, else 'generations').",
+)
+@click.option(
+    "--supabase-limit",
+    default=None,
+    type=int,
+    help="Maximum rows to fetch from Supabase (default: no limit; API may still cap).",
+)
 @click.option("--output", "output_path", default="data/annotated.jsonl", type=click.Path(path_type=Path))
 @click.option(
     "--model",
-    default="anthropic/claude-3.5-sonnet",
-    help="OpenRouter model id (e.g. anthropic/claude-3.5-sonnet, openai/gpt-4o).",
+    default=None,
+    envvar="OPENROUTER_ANNOTATOR_MODEL",
+    help="OpenRouter model id (required). Env OPENROUTER_ANNOTATOR_MODEL if flag omitted.",
 )
 @click.option("--max-tokens", default=8192)
 @click.option("--temperature", default=0.0)
@@ -375,9 +488,12 @@ def run(
 @click.option("--num-items", default=None, type=int)
 @click.option("--verbose", "-v", is_flag=True)
 def main(
-    input_path: Path,
+    input_path: Optional[Path],
+    supabase: bool,
+    supabase_table: Optional[str],
+    supabase_limit: Optional[int],
     output_path: Path,
-    model: str,
+    model: Optional[str],
     max_tokens: int,
     temperature: float,
     max_concurrent: int,
@@ -388,10 +504,20 @@ def main(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    if not supabase and input_path is None:
+        raise SystemExit("Provide --input PATH.jsonl or use --supabase.")
+    if not model or not str(model).strip():
+        raise SystemExit(
+            "Set --model MODEL or OPENROUTER_ANNOTATOR_MODEL to an OpenRouter model id "
+            "(e.g. openai/gpt-4o-mini). See https://openrouter.ai/models"
+        )
     run(
-        input_path=input_path,
         output_path=output_path,
-        model=model,
+        model=str(model).strip(),
+        input_path=input_path,
+        from_supabase=supabase,
+        supabase_table=supabase_table,
+        supabase_limit=supabase_limit,
         max_tokens=max_tokens,
         temperature=temperature,
         max_concurrent=max_concurrent,

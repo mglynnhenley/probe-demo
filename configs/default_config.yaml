@@ -36,14 +36,22 @@ annotations_jsonl: data/annotated.jsonl
 
 val_fraction: 0.1
 
-# Rare positive class (violations): use "auto" for BCE pos_weight = n_nonviol / n_viol on train
+# Rare positive class: "auto" uses effective n_neg/n_pos given row sampling (see train.py logs)
 pos_weight: auto
 # Optional cap on auto pos_weight if ratio is extreme (null = no cap)
 pos_weight_max: null
 
+# Set true once to log sampler weight stats and approx P(batch has zero pos tokens) (p0^B)
+# debug_sampling: false
+
+# WeightedRandomSampler: w = w_min + (w_max - w_min) * frac_pos (violation share of completion tokens)
+sampler_row_weight_min: 1.0
+sampler_row_weight_max: 10.0
+
 # ── Training ───────────────────────────────────────────────────────────────
 epochs: 3
-train_batch_size: 1
+# Sequences per vLLM prefill (Trainer microbatch); capped to KV budget — see train.py log for the max
+train_batch_size: 8
 grad_accumulation_steps: 1
 probe_lr: 1.0e-3
 warmup_steps: 50

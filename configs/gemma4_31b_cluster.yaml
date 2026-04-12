@@ -11,13 +11,13 @@ dtype: "auto"
 
 # Match general_tests/random_vllm/run_gemma4_31b.py on 4×V100: 2048 + 0.75 leaves room for
 # weights + KV + probe connector. Raise on a single large GPU (e.g. H200) if you need longer context.
-max_model_len: 4096
+max_model_len: 2048
 
 # Same as run_gemma4_31b.py; raising toward 0.9 is usually fine on H200 with TP=1.
-gpu_memory_utilization: 0.9
+gpu_memory_utilization: 0.75
 
 # Single H200: one replica, no tensor parallel unless you shard across GPUs.
-tensor_parallel_size: 1 # for running on 4 V100s this tensor parallelism is needed
+tensor_parallel_size: 4 # for running on 4 V100s this tensor parallelism is needed
 
 # Gemma 4 31B dense has 60 layers (indices 0–59). Mid/late layer example:
 layer_idx: 45

@@ -21,3 +21,13 @@ __pycache__/
 
 # backups
 backups/
+
+# stored data
+data/**
+!/data/.gitkeep
+
+# development
+dev_scripts/
+
+# output probes
+output/

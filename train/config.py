@@ -19,6 +19,8 @@ class TrainingConfig:
     dtype: Optional[str] = None
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.75
+    # None: enable chunked prefill only on Ampere+ (cc>=8); false saves VRAM on V100/Pascal.
+    enable_chunked_prefill: Optional[bool] = None
     # Tensor parallel width required for this model; combined with available GPUs → (tp, dp)
     tensor_parallel_size: int = 1
     layer_idx: int = 30  # hidden state layer extracted by vLLM (valid range depends on model depth)
@@ -35,14 +37,20 @@ class TrainingConfig:
     # ── Data ─────────────────────────────────────────────────────────────
     annotations_jsonl: str = "data/annotated.jsonl"  # path to JSONL
     val_fraction: float = 0.1
-    # BCE pos_weight for rare violation tokens (1) vs common non-violation (0); "auto" = n_neg/n_pos on train
+    # BCE pos_weight for rare violation tokens (1) vs common non-violation (0); "auto" = effective n_neg/n_pos given row sampling
     pos_weight: Union[str, float, None] = "auto"
     # If set, caps auto pos_weight (e.g. 500) when violations are extremely rare
     pos_weight_max: Optional[float] = None
+    # If True, print weight stats, Σ(w·n), P(batch has zero pos tokens), etc. (see data.debug_print_weighted_sampling_stats)
+    debug_sampling: bool = False
+    # WeightedRandomSampler: w = w_min + (w_max - w_min) * frac_pos, frac_pos = violation completion tokens / all labelled completion tokens
+    sampler_row_weight_min: float = 1.0
+    sampler_row_weight_max: float = 10.0
 
     # ── Training ─────────────────────────────────────────────────────────
     epochs: int = 3
-    train_batch_size: int = 1
+    # Sequences per vLLM prefill call (capped to KV budget in train.py; default >1 for throughput)
+    train_batch_size: int = 8
     grad_accumulation_steps: int = 1
     probe_lr: float = 1e-3
     warmup_steps: int = 50

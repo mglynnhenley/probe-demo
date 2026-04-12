@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PolicyViolationSpan(BaseModel):
     """A substring of the completion that explicitly violates the policy."""
+
+    model_config = ConfigDict(extra="ignore")
 
     span: str
     verification_note: str = ""
@@ -17,6 +19,8 @@ class PolicyViolationSpan(BaseModel):
 
 class GenerationRecord(BaseModel):
     """One line of generations JSONL (input) or annotated JSONL (output)."""
+
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     question: str
