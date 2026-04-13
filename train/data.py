@@ -56,7 +56,7 @@ def _map_violation_spans_to_val(data: List[Dict[str, Any]]) -> List[Dict[str, An
     return data
 
 
-def _load_annotations(path: Path, test_size: float = 0.1) -> DatasetDict:
+def _load_annotations(path: Path, test_size: float = 0.1, seed: int = 42) -> DatasetDict:
     """Load JSONL into a DatasetDict with train/eval split (HuggingFace still uses ``test_size`` for the held-out fraction).
 
     Expected JSONL fields include ``question``, ``completion``, and optional ``annotations``
@@ -80,7 +80,7 @@ def _load_annotations(path: Path, test_size: float = 0.1) -> DatasetDict:
 
     rows = _map_violation_spans_to_val(rows)
     dataset = Dataset.from_list(rows)
-    split = dataset.train_test_split(test_size=test_size)
+    split = dataset.train_test_split(test_size=test_size, seed=seed)
     return DatasetDict(train=split["train"], eval=split["test"])
 
 
@@ -419,6 +419,6 @@ def truncate_dataset(
     return out
 
 
-def build_annotations_dataset_dict(path: Path, test_size: float = 0.1) -> DatasetDict:
+def build_annotations_dataset_dict(path: Path, test_size: float = 0.1, seed: int = 42) -> DatasetDict:
     """Build a ``DatasetDict`` from an annotated JSONL path (``train`` / ``eval`` split; no padding here)."""
-    return _load_annotations(path, test_size=test_size)
+    return _load_annotations(path, test_size=test_size, seed=seed)

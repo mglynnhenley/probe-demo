@@ -44,6 +44,12 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
+class CovSeqModel(nn.Module):
+    """sequence model with covariant pooling across tokens"""
+    def __init__(self, input_size: int, hidden_sizes: List[int], output_size: int) -> None:
+        pass
+
+
 class ValueHeadProbe:
     """Wraps the probe MLP plus :class:`ProbeConfig` (architecture and provenance)."""
 

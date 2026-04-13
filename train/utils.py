@@ -91,20 +91,29 @@ def probe_prefill_token_count(
 def probe_completion_char_start(
     tokenizer: PreTrainedTokenizerBase,
     prompt: str,
+    completion: str,
     *,
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> int:
     """Character offset in rendered chat text where the assistant completion begins.
 
-    Matches :func:`encode_probe_chat` + assistant message boundaries used in training.
+    Some chat templates (Gemma 4, for example) render
+    ``[user] + add_generation_prompt=True`` differently from the prefix of a full
+    ``[user, assistant]`` conversation, so using the former can misalign labels.
+    We therefore locate the **actual completion text** inside the fully rendered chat.
     """
-    text = apply_chat_template_to_text(
+    full_text = apply_chat_template_to_text(
         tokenizer,
-        [{"role": "user", "content": prompt}],
+        [{"role": "user", "content": prompt}, {"role": "assistant", "content": completion}],
         chat_template_kwargs=chat_template_kwargs,
-        add_generation_prompt=True,
     )
-    return len(text)
+    start = full_text.rfind(completion)
+    if start < 0:
+        raise ValueError(
+            "Could not locate assistant completion inside rendered chat template; "
+            "check tokenizer.apply_chat_template behavior for this model."
+        )
+    return start
 
 
 def map_char_labels_to_completion_token_labels(
@@ -119,7 +128,7 @@ def map_char_labels_to_completion_token_labels(
     non-violation, else ``-100`` (ignored by loss).
     """
     comp_idx = next(
-        (idx for idx, (start, _) in enumerate(offset_mapping) if start >= comp_char_start),
+        (idx for idx, (_, end) in enumerate(offset_mapping) if end > comp_char_start),
         len(offset_mapping),
     )
     comp_offsets = offset_mapping[comp_idx:]
@@ -165,7 +174,7 @@ def probe_completion_token_labels(
     else:
         ann = torch.tensor(annotations_val, dtype=torch.float32)
     comp_start = probe_completion_char_start(
-        tokenizer, prompt, chat_template_kwargs=chat_template_kwargs
+        tokenizer, prompt, completion, chat_template_kwargs=chat_template_kwargs
     )
     labels, _comp_idx = map_char_labels_to_completion_token_labels(
         ann, enc["offset_mapping"], comp_start
@@ -260,14 +269,12 @@ def _json_sanitize(obj: object) -> object:
 
 
 def save_training_metrics_json(trainer: object, path: Path | str) -> None:
-    """Write :attr:`Trainer.state.log_history` and a short run summary to a JSON file.
+    """Write ``Trainer.state.log_history`` and a short run summary to ``training_metrics.json``.
 
-    Includes loss (from Trainer), training ``f1`` / ``token_accuracy``, and eval metrics
-    (``eval_loss``, ``eval_f1``, ``eval_token_accuracy``, …) whenever they were logged.
+    :class:`~trainer.ProbeTrainer` coalesces logging so each global step is typically a
+    single history row (loss + probe metrics; eval/runtime merged into that step).
 
-    Serializes in memory first, then writes atomically, so a failed dump does not truncate
-    ``training_metrics.json`` to empty. The same ``log_history`` is also stored under
-    ``<output_dir>/checkpoint-*/trainer_state.json`` by Hugging Face.
+    Serializes in memory first, then writes atomically.
     """
     import json
     import os

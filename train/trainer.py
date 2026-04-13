@@ -71,6 +71,26 @@ class ProbeTrainer(Trainer):
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
+        # Stashed in compute_loss, merged into the next training ``log()`` (loss row) so we do not double-log.
+        self._pending_probe_metrics: Optional[Dict[str, float]] = None
+
+    def log(self, logs: Any, start_time: Optional[float] = None) -> None:  # type: ignore[override]
+        """Single ``log_history`` row per ``global_step``: merge probe metrics into the loss row; merge eval/runtime into the same step."""
+        if not isinstance(logs, dict):
+            return super().log(logs, start_time)
+
+        logs = dict(logs)
+        if "loss" in logs and self._pending_probe_metrics is not None:
+            logs.update(self._pending_probe_metrics)
+            self._pending_probe_metrics = None
+
+        if self.state.log_history:
+            last = self.state.log_history[-1]
+            if last.get("step") == self.state.global_step:
+                prev = self.state.log_history.pop()
+                logs = {**prev, **logs}
+
+        return super().log(logs, start_time)
 
     def _move_model_to_device(self, model: nn.Module, device: torch.device) -> nn.Module:
         # vLLM owns GPUs; probe stays on CPU (hidden states arrive as CPU tensors).
@@ -126,9 +146,12 @@ class ProbeTrainer(Trainer):
 
         comp_char_starts = [
             probe_completion_char_start(
-                self.processing_class, p, chat_template_kwargs=self.chat_template_kwargs
+                self.processing_class,
+                p,
+                c,
+                chat_template_kwargs=self.chat_template_kwargs,
             )
-            for p in prompts
+            for p, c in zip(prompts, completions)
         ]
 
         hidden_states_dict = self._get_hidden_states(token_id_lists)
@@ -182,7 +205,7 @@ class ProbeTrainer(Trainer):
                 "frac_pred_viol": pred_viol.mean().item(),
             }
             if self.model.training:
-                self.log(metrics)
+                self._pending_probe_metrics = metrics
 
         if return_outputs:
             return (loss, logits, ann_tok)

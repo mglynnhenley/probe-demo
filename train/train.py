@@ -119,6 +119,7 @@ def main(config_path: Path) -> None:
     annotations_dataset_dict = build_annotations_dataset_dict(
         path=Path(cfg.annotations_jsonl),
         test_size=cfg.val_fraction,
+        seed=cfg.seed,
     )
     print(f"Loaded annotations from {cfg.annotations_jsonl}")
 
