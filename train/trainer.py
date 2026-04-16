@@ -10,6 +10,7 @@ always predicting non-violation) for context.
 
 from __future__ import annotations
 
+from pathlib import Path
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -26,6 +27,7 @@ from vllm.lora.request import LoRARequest
 
 from data import build_probe_feature_batches, prepare_probe_batch
 from models import ValueHeadProbe
+from utils import save_training_metrics_json
 from vllm_probe_plugin import extract_prefill_hidden_states
 
 
@@ -437,3 +439,14 @@ class ProbeTrainer(Trainer):
                 replacement=True,
             )
         return RandomSampler(ds)
+
+    def _save_checkpoint(self, model: nn.Module, trial: Any) -> None:
+        super()._save_checkpoint(model, trial)
+        if not self.args.should_save:
+            return
+
+        checkpoint_dir = (
+            Path(self._get_output_dir(trial=trial))
+            / f"checkpoint-{self.state.global_step}"
+        )
+        save_training_metrics_json(self, checkpoint_dir / "training_metrics.json")

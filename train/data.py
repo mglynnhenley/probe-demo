@@ -75,12 +75,8 @@ def _map_violation_spans_to_val(data: List[Dict[str, Any]]) -> List[Dict[str, An
     return data
 
 
-def _load_annotations(path: Path, test_size: float = 0.1, seed: int = 42) -> DatasetDict:
-    """Load JSONL into a DatasetDict with train/eval split (HuggingFace still uses ``test_size`` for the held-out fraction).
-
-    Expected JSONL fields include ``question``, ``completion``, and optional ``annotations``
-    (list of dicts with ``span``, ``index``, ``verification_note``). Other fields are kept.
-    """
+def _load_annotation_rows(path: Path) -> List[Dict[str, Any]]:
+    """Load and normalize annotation rows from JSONL, preserving original order."""
     field_rename = {"question": "prompt"}
 
     rows: List[Dict[str, Any]] = []
@@ -97,7 +93,16 @@ def _load_annotations(path: Path, test_size: float = 0.1, seed: int = 42) -> Dat
                 raise ValueError(f"Missing question/prompt or completion: {line[:200]!r}")
             rows.append(row)
 
-    rows = _map_violation_spans_to_val(rows)
+    return _map_violation_spans_to_val(rows)
+
+
+def _load_annotations(path: Path, test_size: float = 0.1, seed: int = 42) -> DatasetDict:
+    """Load JSONL into a DatasetDict with train/eval split (HuggingFace still uses ``test_size`` for the held-out fraction).
+
+    Expected JSONL fields include ``question``, ``completion``, and optional ``annotations``
+    (list of dicts with ``span``, ``index``, ``verification_note``). Other fields are kept.
+    """
+    rows = _load_annotation_rows(path)
     dataset = Dataset.from_list(rows)
     split = dataset.train_test_split(test_size=test_size, seed=seed)
     return DatasetDict(train=split["train"], eval=split["test"])
@@ -561,3 +566,8 @@ def truncate_dataset(
 def build_annotations_dataset_dict(path: Path, test_size: float = 0.1, seed: int = 42) -> DatasetDict:
     """Build a ``DatasetDict`` from an annotated JSONL path (``train`` / ``eval`` split; no padding here)."""
     return _load_annotations(path, test_size=test_size, seed=seed)
+
+
+def build_annotations_dataset(path: Path) -> Dataset:
+    """Build a single unsplit ``Dataset`` from an annotated JSONL path."""
+    return Dataset.from_list(_load_annotation_rows(path))

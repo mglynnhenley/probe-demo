@@ -74,6 +74,7 @@ def _split_log_history(
                     float(e.get("token_accuracy", float("nan"))),
                     float(e.get("prec_viol", float("nan"))),
                     float(e.get("tpr", float("nan"))),
+                    float(e.get("tnr", float("nan"))),
                     float(e.get("frac_pred_viol", float("nan"))),
                     float(e.get("n_violation_tokens_in_batch", float("nan"))),
                     float(e.get("n_nonviolation_tokens_in_batch", float("nan"))),
@@ -119,6 +120,7 @@ def plot_metrics(
         ax.plot(steps, [x[1] for x in probe_data], color="C0", linewidth=0.6, alpha=0.8, label="f1")
         ax.plot(steps, [x[3] for x in probe_data], color="C1", linewidth=0.6, alpha=0.7, label="prec_viol")
         ax.plot(steps, [x[4] for x in probe_data], color="C3", linewidth=0.6, alpha=0.7, label="tpr")
+        ax.plot(steps, [x[5] for x in probe_data], color="C4", linewidth=0.6, alpha=0.7, label="tnr")
         ax.set_ylabel("score")
         ax.set_xlabel("step")
         ax.set_ylim(-0.05, 1.05)
@@ -135,6 +137,7 @@ def plot_metrics(
         ax.plot(steps, [x[2] for x in eval_data], "o-", color="C0", markersize=3, label="eval_f1")
         ax.plot(steps, [x[4] for x in eval_data], "s-", color="C1", markersize=2, alpha=0.85, label="eval_prec")
         ax.plot(steps, [x[5] for x in eval_data], "^-", color="C3", markersize=2, alpha=0.85, label="eval_tpr")
+        ax.plot(steps, [x[6] for x in eval_data], "d-", color="C4", markersize=2, alpha=0.85, label="eval_tnr")
         ax.set_ylabel("score")
         ax.set_xlabel("step")
         ax.set_ylim(-0.05, 1.05)
@@ -152,7 +155,7 @@ def plot_metrics(
     ax = axes[1, 1]
     if probe_data:
         steps = [x[0] for x in probe_data]
-        ax.plot(steps, [x[5] for x in probe_data], color="purple", linewidth=0.5, alpha=0.75)
+        ax.plot(steps, [x[6] for x in probe_data], color="purple", linewidth=0.5, alpha=0.75)
         ax.set_xlabel("step")
         ax.set_ylabel("frac_pred_viol")
         ax.set_ylim(-0.05, 1.05)
@@ -252,10 +255,11 @@ def build_summary_text(
             f"token_accuracy={float(final[2]):.6f}  "
             f"prec_viol={float(final[3]):.6f}  "
             f"tpr={float(final[4]):.6f}  "
-            f"frac_pred_viol={float(final[5]):.6f}"
+            f"tnr={float(final[5]):.6f}  "
+            f"frac_pred_viol={float(final[6]):.6f}"
         )
         lines.append(
-            f"final batch token counts: violation={int(final[6])}  nonviolation={int(final[7])}"
+            f"final batch token counts: violation={int(final[7])}  nonviolation={int(final[8])}"
         )
         if best_f1 is not None:
             lines.append(f"best train f1={best_f1[1]:.6f} at step={best_f1[0]}")
