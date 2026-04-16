@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union, get_args, get_origin, get_type_hints
 
 import yaml
+
+from models import ProbeModelConfig
 
 
 @dataclass
@@ -30,9 +32,8 @@ class TrainingConfig:
     lora_present: bool = False
     lora_path: str = "output/lora_adapter/"
 
-    # ── Probe head (set hidden_size to the base model’s d_model) ──────────
-    hidden_size: int = 4096
-    probe_hidden_sizes: List[int] = field(default_factory=list)  # [] = linear probe
+    # ── Probe head ────────────────────────────────────────────────────────
+    probe: ProbeModelConfig = field(default_factory=ProbeModelConfig)
 
     # ── Data ─────────────────────────────────────────────────────────────
     annotations_jsonl: str = "data/annotated.jsonl"  # path to JSONL
@@ -65,7 +66,7 @@ class TrainingConfig:
 
     @staticmethod
     def from_yaml(path: Path | str) -> TrainingConfig:
-        """Load a flat YAML mapping into :class:`TrainingConfig`. Unknown keys raise."""
+        """Load YAML into :class:`TrainingConfig`. Unknown keys raise."""
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
         if raw is None:
@@ -74,9 +75,50 @@ class TrainingConfig:
             raise ValueError(f"Config root must be a mapping, got {type(raw).__name__}")
 
         cfg = TrainingConfig()
-        valid = {f.name for f in fields(TrainingConfig)}
+        valid = {f.name: f for f in fields(TrainingConfig)}
+        type_hints = get_type_hints(TrainingConfig)
         for key, value in raw.items():
             if key not in valid:
                 raise ValueError(f"Unknown config key: {key!r} (valid: {sorted(valid)})")
-            setattr(cfg, key, value)
+            setattr(cfg, key, _coerce_dataclass_field(type_hints.get(key, valid[key].type), value))
         return cfg
+
+
+def _coerce_dataclass_field(field_type: Any, value: Any) -> Any:
+    """Recursively instantiate nested dataclass fields from YAML mappings."""
+    dataclass_type = _resolve_dataclass_type(field_type)
+    if dataclass_type is None or value is None:
+        return value
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Expected mapping for nested dataclass {dataclass_type.__name__}, "
+            f"got {type(value).__name__}"
+        )
+
+    kwargs: dict[str, Any] = {}
+    valid = {f.name: f for f in fields(dataclass_type)}
+    type_hints = get_type_hints(dataclass_type)
+    for key, nested_value in value.items():
+        if key not in valid:
+            raise ValueError(
+                f"Unknown config key {key!r} for {dataclass_type.__name__} "
+                f"(valid: {sorted(valid)})"
+            )
+        kwargs[key] = _coerce_dataclass_field(
+            type_hints.get(key, valid[key].type),
+            nested_value,
+        )
+    return dataclass_type(**kwargs)
+
+
+def _resolve_dataclass_type(field_type: Any) -> Any:
+    if is_dataclass(field_type):
+        return field_type
+    origin = get_origin(field_type)
+    if origin is Union:
+        for candidate in get_args(field_type):
+            if candidate is type(None):
+                continue
+            if is_dataclass(candidate):
+                return candidate
+    return None

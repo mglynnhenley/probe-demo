@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+import click
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -115,21 +116,9 @@ def _raise_if_html_404(exc: BaseException, *, table: str) -> None:
     raise exc
 
 
-def fetch_generations_raw(
-    table: str | None = None,
-    *,
-    limit: Optional[int] = None,
-    columns: str = "*",
-) -> list[dict[str, Any]]:
-    """Fetch rows from ``table`` as plain dicts (``table`` defaults via :func:`default_generations_table`)."""
-    if table is None:
-        table = default_generations_table()
-    client = get_supabase_client()
-    q = client.table(table).select(columns)
-    if limit is not None:
-        q = q.limit(limit)
+def _execute_query(query, *, table: str):
     try:
-        resp = q.execute()
+        resp = query.execute()
     except Exception as e:
         _raise_if_html_404(e, table=table)
         raise
@@ -139,18 +128,167 @@ def fetch_generations_raw(
     return list(data)
 
 
+def _fetch_generations_page(
+    client,
+    *,
+    table: str,
+    columns: str,
+    start: int,
+    stop: int,
+) -> list[dict[str, Any]]:
+    query = client.table(table).select(columns).range(start, stop)
+    return _execute_query(query, table=table)
+
+
+def fetch_generations_raw(
+    table: str | None = None,
+    *,
+    limit: Optional[int] = None,
+    columns: str = "*",
+    paginate: bool = False,
+    page_size: int = 1000,
+) -> list[dict[str, Any]]:
+    """Fetch rows from ``table`` as plain dicts (``table`` defaults via :func:`default_generations_table`)."""
+    if table is None:
+        table = default_generations_table()
+    client = get_supabase_client()
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    if not paginate:
+        query = client.table(table).select(columns)
+        if limit is not None:
+            query = query.limit(limit)
+        return _execute_query(query, table=table)
+
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        remaining = None if limit is None else limit - len(rows)
+        if remaining is not None and remaining <= 0:
+            break
+
+        batch_size = page_size if remaining is None else min(page_size, remaining)
+        page = _fetch_generations_page(
+            client,
+            table=table,
+            columns=columns,
+            start=offset,
+            stop=offset + batch_size - 1,
+        )
+        if not page:
+            break
+
+        rows.extend(page)
+        if len(page) < batch_size:
+            break
+        offset += batch_size
+
+    return rows
+
+
 def fetch_generation_records(
     table: str | None = None,
     *,
     limit: Optional[int] = None,
+    paginate: bool = False,
+    page_size: int = 1000,
 ) -> list[Any]:
     """Fetch rows from Supabase and validate as :class:`~annotation_pipeline.data_models.GenerationRecord`."""
     from annotation_pipeline.data_models import GenerationRecord
 
-    rows = fetch_generations_raw(table=table, limit=limit)  # None → default_generations_table()
+    rows = fetch_generations_raw(
+        table=table,
+        limit=limit,
+        paginate=paginate,
+        page_size=page_size,
+    )
     out = []
     for row in rows:
         row = dict(row)
         row.pop("logprobs", None)
         out.append(GenerationRecord.model_validate(row))
     return out
+
+
+def download_generation_records_jsonl(
+    output_path: Path,
+    *,
+    table: str | None = None,
+    limit: Optional[int] = None,
+    download_all: bool = False,
+    page_size: int = 1000,
+) -> int:
+    """Write Supabase generations to JSONL consumable by ``annotate.py``."""
+    records = fetch_generation_records(
+        table=table,
+        limit=limit,
+        paginate=download_all,
+        page_size=page_size,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(rec.model_dump_json(exclude_none=False) + "\n")
+    return len(records)
+
+
+@click.command(context_settings=dict(help_option_names=["-h", "--help"], show_default=True))
+@click.option(
+    "--table",
+    default=None,
+    type=str,
+    help="Supabase table name (default: env SUPABASE_GENERATIONS_TABLE, else 'generations').",
+)
+@click.option(
+    "--output",
+    "output_path",
+    default="data/generations.jsonl",
+    type=click.Path(path_type=Path),
+    help="Write annotation-ready generations JSONL here.",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Maximum number of rows to download.",
+)
+@click.option(
+    "--all",
+    "download_all",
+    is_flag=True,
+    default=False,
+    help="Paginate through the whole table (or until --limit rows are downloaded).",
+)
+@click.option(
+    "--page-size",
+    default=1000,
+    type=int,
+    help="Rows per Supabase page when using --all.",
+)
+def main(
+    table: Optional[str],
+    output_path: Path,
+    limit: Optional[int],
+    download_all: bool,
+    page_size: int,
+) -> None:
+    if limit is not None and limit <= 0:
+        raise SystemExit("--limit must be positive.")
+    if page_size <= 0:
+        raise SystemExit("--page-size must be positive.")
+
+    n = download_generation_records_jsonl(
+        output_path=output_path,
+        table=table,
+        limit=limit,
+        download_all=download_all,
+        page_size=page_size,
+    )
+    mode = "paginated" if download_all else "single-request"
+    table_name = table if table is not None else default_generations_table()
+    click.echo(f"Wrote {n} generation row(s) from {table_name!r} to {output_path} ({mode}).")
+
+
+if __name__ == "__main__":
+    main()

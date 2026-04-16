@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "anthropic>=0.40.0",
     "vllm-probe-plugin",
     # Align with Gemma 4 + vLLM 0.19+ inference stacks (transformers v5 tokenizer / chat templates).
     "accelerate>=1.13.0",

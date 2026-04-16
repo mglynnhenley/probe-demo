@@ -10,6 +10,7 @@ always predicting non-violation) for context.
 
 from __future__ import annotations
 
+import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -23,13 +24,92 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import has_length
 from vllm.lora.request import LoRARequest
 
+from data import build_probe_feature_batches, prepare_probe_batch
 from models import ValueHeadProbe
-from utils import (
-    encode_probe_chat,
-    map_char_labels_to_completion_token_labels,
-    probe_completion_char_start,
-)
 from vllm_probe_plugin import extract_prefill_hidden_states
+
+
+class StreamingLinearR2Reservoir:
+    """Bounded-memory linear-fit diagnostic on streamed token embeddings.
+
+    Keeps a uniform reservoir sample of labelled completion-token embeddings and
+    periodically fits an ordinary least-squares linear model ``y ≈ Xw + b`` on
+    that sample to estimate how linear the label map is in the underlying
+    embeddings.
+    """
+
+    def __init__(self, reservoir_size: int = 8192, seed: int = 0) -> None:
+        self.reservoir_size = reservoir_size
+        self._rng = random.Random(seed)
+        self._features: Optional[torch.Tensor] = None
+        self._labels: Optional[torch.Tensor] = None
+        self._feature_dim: Optional[int] = None
+        self.n_seen = 0
+        self.n_stored = 0
+
+    def update(self, features: torch.Tensor, labels: torch.Tensor) -> None:
+        if self.reservoir_size <= 0 or features.numel() == 0:
+            return
+        if features.dim() != 2:
+            raise ValueError(f"Expected features [n, d], got shape {tuple(features.shape)}")
+        labels = labels.view(-1)
+        if features.shape[0] != labels.shape[0]:
+            raise ValueError(
+                f"features rows {features.shape[0]} != labels rows {labels.shape[0]}"
+            )
+
+        features = features.detach().to("cpu", dtype=torch.float32)
+        labels = labels.detach().to("cpu", dtype=torch.float32)
+
+        if self._features is None or self._labels is None:
+            self._feature_dim = int(features.shape[1])
+            self._features = torch.empty(
+                (self.reservoir_size, self._feature_dim), dtype=torch.float32
+            )
+            self._labels = torch.empty((self.reservoir_size,), dtype=torch.float32)
+        elif features.shape[1] != self._feature_dim:
+            raise ValueError(
+                f"Feature dim changed from {self._feature_dim} to {features.shape[1]}"
+            )
+
+        assert self._features is not None
+        assert self._labels is not None
+
+        for row, label in zip(features, labels):
+            self.n_seen += 1
+            if self.n_stored < self.reservoir_size:
+                idx = self.n_stored
+                self.n_stored += 1
+            else:
+                idx = self._rng.randrange(self.n_seen)
+                if idx >= self.reservoir_size:
+                    continue
+            self._features[idx].copy_(row)
+            self._labels[idx] = label
+
+    def compute_r2(self) -> Optional[float]:
+        if (
+            self._features is None
+            or self._labels is None
+            or self._feature_dim is None
+            or self.n_stored <= self._feature_dim + 1
+        ):
+            return None
+
+        X = self._features[: self.n_stored].to(dtype=torch.float64)
+        y = self._labels[: self.n_stored].to(dtype=torch.float64)
+        sst = torch.sum((y - y.mean()).square())
+        if float(sst.item()) <= 1e-12:
+            return None
+
+        X_aug = torch.cat(
+            [X, torch.ones((self.n_stored, 1), dtype=torch.float64)],
+            dim=1,
+        )
+        solution = torch.linalg.lstsq(X_aug, y.unsqueeze(-1)).solution.squeeze(-1)
+        y_hat = X_aug @ solution
+        sse = torch.sum((y - y_hat).square())
+        return float((1.0 - sse / sst).item())
 
 
 class ProbeTrainer(Trainer):
@@ -53,6 +133,7 @@ class ProbeTrainer(Trainer):
         pos_weight: Optional[float] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         train_sampler_weights: Optional[List[float]] = None,
+        probe_training_metrics_interval_epochs: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -71,8 +152,20 @@ class ProbeTrainer(Trainer):
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
+        self.probe_training_metrics_interval_epochs = probe_training_metrics_interval_epochs
+        self._next_probe_training_metrics_epoch = (
+            probe_training_metrics_interval_epochs
+            if probe_training_metrics_interval_epochs is not None
+            and probe_training_metrics_interval_epochs > 0
+            else None
+        )
+        self._latest_probe_metrics_batch: Optional[torch.Tensor] = None
         # Stashed in compute_loss, merged into the next training ``log()`` (loss row) so we do not double-log.
         self._pending_probe_metrics: Optional[Dict[str, float]] = None
+        self._linear_r2_reservoir = StreamingLinearR2Reservoir(
+            reservoir_size=8192,
+            seed=int(getattr(args, "seed", 0)),
+        )
 
     def log(self, logs: Any, start_time: Optional[float] = None) -> None:  # type: ignore[override]
         """Single ``log_history`` row per ``global_step``: merge probe metrics into the loss row; merge eval/runtime into the same step."""
@@ -96,16 +189,6 @@ class ProbeTrainer(Trainer):
         # vLLM owns GPUs; probe stays on CPU (hidden states arrive as CPU tensors).
         return model
 
-    def _clear_unlabelled(
-        self, logits: torch.Tensor, annotations: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        mask = annotations != -100
-        logits = logits[mask]
-        annotations = annotations[mask]
-        if mask.sum() == 0:
-            return None, None
-        return logits, annotations
-
     def _get_hidden_states(self, token_id_lists: List[List[int]]) -> Dict[int, List[torch.Tensor]]:
         sampling_params = vllm.SamplingParams(n=1, temperature=0.0, max_tokens=1)
         outputs = self.vllm_llm.generate(
@@ -121,6 +204,75 @@ class ProbeTrainer(Trainer):
                 hidden_states_dict.setdefault(layer_id, []).append(hs)
         return hidden_states_dict
 
+    def _stash_probe_metrics_batch(self, feature_batches: List[Any]) -> None:
+        seq_batches = [
+            batch.features
+            for batch in feature_batches
+            if isinstance(batch.features, torch.Tensor) and batch.features.dim() == 3
+        ]
+        if not seq_batches:
+            self._latest_probe_metrics_batch = None
+            return
+        self._latest_probe_metrics_batch = max(seq_batches, key=lambda batch: int(batch.shape[1]))
+
+    def _update_linear_r2_reservoir(
+        self,
+        hidden_states_list: List[torch.Tensor],
+        completion_token_labels: List[torch.Tensor],
+    ) -> None:
+        if not self.model.training:
+            return
+        for hidden_states, token_labels in zip(hidden_states_list, completion_token_labels):
+            n_completion_tokens = int(token_labels.shape[0])
+            completion_hidden_states = (
+                hidden_states[-n_completion_tokens:] if n_completion_tokens else hidden_states[:0]
+            )
+            n_tokens = min(completion_hidden_states.shape[0], token_labels.shape[0])
+            if n_tokens == 0:
+                continue
+            token_labels = token_labels[:n_tokens]
+            keep = token_labels != -100
+            if not keep.any():
+                continue
+            self._linear_r2_reservoir.update(
+                completion_hidden_states[:n_tokens][keep].float(),
+                token_labels[keep].float(),
+            )
+
+    def _maybe_print_probe_training_metrics(self) -> None:
+        interval = self.probe_training_metrics_interval_epochs
+        next_epoch = self._next_probe_training_metrics_epoch
+        if interval is None or interval <= 0 or next_epoch is None:
+            return
+
+        epoch = self.state.epoch
+        metrics_fn = getattr(self.probe.model, "training_metrics", None)
+        batch = self._latest_probe_metrics_batch
+        if epoch is None or epoch + 1e-12 < next_epoch or not callable(metrics_fn) or batch is None:
+            return
+
+        metrics = metrics_fn(batch)
+        print("")
+        print(f"[probe.training_metrics] epoch={epoch:.3f}")
+        for key, value in metrics.items():
+            print(f"  {key}: {value:.6g}")
+        linear_r2 = self._linear_r2_reservoir.compute_r2()
+        if linear_r2 is None:
+            print(
+                "  linear_r2_raw_embeddings: pending "
+                f"(reservoir={self._linear_r2_reservoir.n_stored}/{self._linear_r2_reservoir.reservoir_size}, "
+                f"seen={self._linear_r2_reservoir.n_seen})"
+            )
+        else:
+            print(
+                "  linear_r2_raw_embeddings: "
+                f"{linear_r2:.6g} "
+                f"(reservoir={self._linear_r2_reservoir.n_stored}, seen={self._linear_r2_reservoir.n_seen})"
+            )
+
+        while self._next_probe_training_metrics_epoch is not None and epoch + 1e-12 >= self._next_probe_training_metrics_epoch:
+            self._next_probe_training_metrics_epoch += interval
+
     def compute_loss(
         self,
         probe_model: nn.Module,
@@ -132,50 +284,37 @@ class ProbeTrainer(Trainer):
         completions = inputs["completion"]
         annotations = inputs["annotations_val"].float().to(self.args.device)
 
-        encodings = [
-            encode_probe_chat(
-                self.processing_class,
-                [{"role": "user", "content": p}, {"role": "assistant", "content": c}],
-                chat_template_kwargs=self.chat_template_kwargs,
-                return_offsets_mapping=True,
-            )
-            for p, c in zip(prompts, completions)
-        ]
-        token_id_lists = [enc["input_ids"] for enc in encodings]
-        offset_mappings = [enc["offset_mapping"] for enc in encodings]
+        prepared_batch = prepare_probe_batch(
+            self.processing_class,
+            prompts,
+            completions,
+            annotations,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
 
-        comp_char_starts = [
-            probe_completion_char_start(
-                self.processing_class,
-                p,
-                c,
-                chat_template_kwargs=self.chat_template_kwargs,
-            )
-            for p, c in zip(prompts, completions)
-        ]
-
-        hidden_states_dict = self._get_hidden_states(token_id_lists)
+        hidden_states_dict = self._get_hidden_states(prepared_batch.token_id_lists)
         hidden_states_list = hidden_states_dict[self.probe.layer_idx]
+        self._update_linear_r2_reservoir(
+            hidden_states_list,
+            prepared_batch.completion_token_labels,
+        )
+        feature_batches = build_probe_feature_batches(
+            hidden_states_list,
+            prepared_batch.completion_token_labels,
+            self.probe.cfg.model,
+        )
+        self._stash_probe_metrics_batch(feature_batches)
 
-        all_logits: List[torch.Tensor] = []
-        all_ann_tok: List[torch.Tensor] = []
-        for i in range(len(prompts)):
-            ann_token, comp_idx = map_char_labels_to_completion_token_labels(
-                annotations[i], offset_mappings[i], comp_char_starts[i]
-            )
-            hs_i = hidden_states_list[i][comp_idx:, :].float()
-            ann_token = ann_token[: hs_i.shape[0]]
+        if not feature_batches:
+            loss = torch.tensor(0.0, device=self.args.device, requires_grad=True)
+            if return_outputs:
+                empty_logits = torch.empty((0, 1), device=self.args.device)
+                empty_labels = torch.empty((0,), device=self.args.device)
+                return (loss, empty_logits, empty_labels)
+            return loss
 
-            logits_i = probe_model(hs_i)
-            all_logits.append(logits_i)
-            all_ann_tok.append(ann_token.to(self.args.device))
-
-        logits = torch.cat(all_logits, dim=0)
-        ann_tok = torch.cat(all_ann_tok, dim=0)
-
-        logits, ann_tok = self._clear_unlabelled(logits, ann_tok)
-        if logits is None:
-            return torch.tensor(0.0, device=self.args.device, requires_grad=True)
+        logits = torch.cat([probe_model(batch.features) for batch in feature_batches], dim=0)
+        ann_tok = torch.cat([batch.labels.to(self.args.device) for batch in feature_batches], dim=0)
 
         loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)(
             logits.squeeze(-1), ann_tok
@@ -264,6 +403,16 @@ class ProbeTrainer(Trainer):
         if prediction_loss_only:
             return (loss.detach(), None, None)
         return (loss.detach(), logits.detach(), labels.detach())
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, List[str]]],
+        num_items_in_batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        self._maybe_print_probe_training_metrics()
+        return loss
 
     def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optional[Union[RandomSampler, WeightedRandomSampler]]:
         """Uniform random rows, or :class:`~torch.utils.data.WeightedRandomSampler` when ``train_sampler_weights`` is set."""

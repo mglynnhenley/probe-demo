@@ -8,17 +8,36 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from datasets import Dataset, DatasetDict
 from torch.nn.utils.rnn import pad_sequence
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from utils import probe_completion_token_labels, probe_prefill_token_count
+from models import ProbeModelConfig
+from utils import encode_probe_chat, probe_completion_token_labels, probe_prefill_token_count
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class PreparedProbeBatch:
+    """Encoded chat inputs plus per-completion-token labels for one trainer batch."""
+
+    token_id_lists: List[List[int]]
+    completion_token_labels: List[torch.Tensor]
+
+
+@dataclass
+class ProbeFeatureBatch:
+    """Model-ready features grouped into a uniform batch shape."""
+
+    features: torch.Tensor
+    labels: torch.Tensor
 
 
 def _map_violation_spans_to_val(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -95,6 +114,126 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             padding_value=-100.0,
         ),
     }
+
+
+def prepare_probe_batch(
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: List[str],
+    completions: List[str],
+    annotations: torch.Tensor,
+    *,
+    chat_template_kwargs: Dict[str, Any] | None = None,
+) -> PreparedProbeBatch:
+    """Tokenize a trainer batch into vLLM inputs and completion-token labels."""
+    token_id_lists: List[List[int]] = []
+    completion_token_labels: List[torch.Tensor] = []
+
+    for prompt, completion, annotation in zip(prompts, completions, annotations):
+        encoding = encode_probe_chat(
+            tokenizer,
+            [{"role": "user", "content": prompt}, {"role": "assistant", "content": completion}],
+            chat_template_kwargs=chat_template_kwargs,
+            return_offsets_mapping=False,
+        )
+        token_labels = probe_completion_token_labels(
+            tokenizer,
+            prompt,
+            completion,
+            annotation,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        completion_token_labels.append(token_labels)
+        token_id_lists.append(encoding["input_ids"])
+
+    return PreparedProbeBatch(
+        token_id_lists=token_id_lists,
+        completion_token_labels=completion_token_labels,
+    )
+
+
+def build_probe_feature_batches(
+    hidden_states_list: List[torch.Tensor],
+    completion_token_labels: List[torch.Tensor],
+    model_cfg: ProbeModelConfig,
+) -> List[ProbeFeatureBatch]:
+    """Build model-ready batches from completion hidden states and token labels.
+
+    For ``covseq``, full-length windows are built with
+    :func:`numpy.lib.stride_tricks.sliding_window_view`; the shorter prefix windows
+    that occur near the start of each completion are added separately so the effective
+    sequence length is truncated instead of padded.
+    """
+    if len(hidden_states_list) != len(completion_token_labels):
+        raise ValueError(
+            "hidden_states_list and completion_token_labels must have the same length"
+        )
+
+    if model_cfg.model_type == "mlp":
+        features: List[torch.Tensor] = []
+        labels: List[torch.Tensor] = []
+        for hidden_states, token_labels in zip(hidden_states_list, completion_token_labels):
+            n_completion_tokens = int(token_labels.shape[0])
+            completion_hidden_states = hidden_states[-n_completion_tokens:] if n_completion_tokens else hidden_states[:0]
+            n_tokens = min(completion_hidden_states.shape[0], token_labels.shape[0])
+            if n_tokens == 0:
+                continue
+            token_labels = token_labels[:n_tokens]
+            keep = token_labels != -100
+            if not keep.any():
+                continue
+            features.append(completion_hidden_states[:n_tokens][keep].float())
+            labels.append(token_labels[keep].float())
+        if not features:
+            return []
+        return [ProbeFeatureBatch(features=torch.cat(features, dim=0), labels=torch.cat(labels, dim=0))]
+
+    if model_cfg.model_type != "covseq":
+        raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
+
+    window_size = model_cfg.covseq.window_size
+    buckets: dict[int, List[torch.Tensor]] = {}
+    label_buckets: dict[int, List[torch.Tensor]] = {}
+
+    for hidden_states, token_labels in zip(hidden_states_list, completion_token_labels):
+        n_completion_tokens = int(token_labels.shape[0])
+        completion_hidden_states = hidden_states[-n_completion_tokens:] if n_completion_tokens else hidden_states[:0]
+        n_tokens = min(completion_hidden_states.shape[0], token_labels.shape[0])
+        if n_tokens == 0:
+            continue
+
+        hidden_states = completion_hidden_states[:n_tokens].float().contiguous()
+        token_labels = token_labels[:n_tokens].float()
+
+        prefix_limit = min(window_size - 1, n_tokens)
+        for seq_len in range(1, prefix_limit + 1):
+            label = token_labels[seq_len - 1]
+            if label == -100:
+                continue
+            buckets.setdefault(seq_len, []).append(hidden_states[:seq_len])
+            label_buckets.setdefault(seq_len, []).append(label)
+
+        if n_tokens >= window_size:
+            token_indices = np.arange(n_tokens)
+            window_indices_np = np.lib.stride_tricks.sliding_window_view(
+                token_indices, window_shape=window_size
+            )
+            window_indices = torch.from_numpy(window_indices_np.copy()).long()
+            full_windows = hidden_states[window_indices]
+            full_labels = token_labels[window_size - 1 :]
+            keep = full_labels != -100
+            if keep.any():
+                buckets.setdefault(window_size, []).extend(list(full_windows[keep]))
+                label_buckets.setdefault(window_size, []).extend(list(full_labels[keep]))
+
+    feature_batches: List[ProbeFeatureBatch] = []
+    for seq_len in sorted(buckets):
+        feature_batches.append(
+            ProbeFeatureBatch(
+                features=torch.stack(buckets[seq_len], dim=0),
+                labels=torch.stack(label_buckets[seq_len], dim=0),
+            )
+        )
+    return feature_batches
 
 
 def count_violation_and_nonviolation_completion_tokens(

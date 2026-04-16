@@ -29,7 +29,7 @@ from data import (
     train_sampler_weights_and_effective_pos_weight,
     truncate_dataset,
 )
-from models import ProbeConfig, ValueHeadProbe
+from models import ProbeConfig, ProbeModelConfig, ValueHeadProbe
 from trainer import ProbeTrainer
 from utils import (
     effective_probe_max_model_len,
@@ -151,6 +151,8 @@ def main(config_path: Path) -> None:
         trust_remote_code=cfg.trust_remote_code,
         enable_chunked_prefill=chunked_prefill,
         enable_lora=cfg.lora_present,
+        # enforce_eager = True, # disabling these optimisations is expensive
+        cudagraph_capture_sizes=[8, 16, 32, 64, 128], # speed up startup time by restricting graphs
     )
 
     if cfg.lora_present:
@@ -172,15 +174,31 @@ def main(config_path: Path) -> None:
             f"(config requested {cfg.max_model_len}); dataset truncation uses {effective_mml}"
         )
 
+    resolved_hidden_size = hidden_size_from_hf_config(hf_config)
+    probe_model_cfg = ProbeModelConfig(
+        probe_model_type=cfg.probe.probe_model_type,
+        hidden_size=resolved_hidden_size,
+        hidden_sizes=list(cfg.probe.hidden_sizes),
+        output_size=cfg.probe.output_size,
+        covseq=cfg.probe.covseq,
+    )
+    if cfg.probe.hidden_size not in (0, resolved_hidden_size):
+        print(
+            f"[probe] hidden_size from model config is {resolved_hidden_size}; "
+            f"overriding YAML value {cfg.probe.hidden_size}"
+        )
     probe_cfg = ProbeConfig(
         layer_idx=cfg.layer_idx,
-        hidden_size=hidden_size_from_hf_config(hf_config),
-        hidden_sizes=cfg.probe_hidden_sizes or None,
-        output_size=1,
+        model=probe_model_cfg,
         underlying_model=cfg.model_name,
         policy=None,
     )
     probe = ValueHeadProbe(probe_cfg)
+    print(
+        f"[probe] model_type={probe.cfg.model.model_type}, hidden_size={resolved_hidden_size}, "
+        f"window_size={probe.cfg.model.covseq.window_size}, "
+        f"compressed_size={probe.cfg.model.covseq.compressed_size}"
+    )
 
     kv_max_batch = optimal_batch_size(llm, effective_mml)
     requested = cfg.train_batch_size
@@ -337,6 +355,7 @@ def main(config_path: Path) -> None:
         args=training_args,
         chat_template_kwargs=cfg.chat_template_kwargs,
         train_sampler_weights=sampler_weights,
+        probe_training_metrics_interval_epochs=cfg.probe.covseq.training_metrics_interval_epochs,
     )
 
     trainer.remove_callback(PrinterCallback)

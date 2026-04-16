@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Annotate completions with policy-violation spans (OpenRouter only).
+Annotate completions with policy-violation spans.
 
 Input is either a generations JSONL file or rows from Supabase (table matching
 README columns: id, question, completion, model, source_dataset, policy).
 
-Calls an annotator model via OpenRouter and writes JSONL with ``annotations`` and
-``annotator_model``. Skips any input row whose ``id`` already appears in the
-output file (resume-safe; does not re-call the API for those ids).
+Backends:
+  - openrouter (default): chat completions via OpenRouter (concurrent requests).
+  - anthropic: Claude via Anthropic API; use ``--batch`` for the Message Batch API
+    (lower cost, async; same semantics as glm5_hallucination_probes annotate.py).
+
+Writes JSONL with ``annotations`` and ``annotator_model``. Resume-safe: skips any
+input row whose ``id`` already has ``annotations`` in the output file (not merely
+present with a failed/partial line). Only un-annotated rows are sent to the API.
 
 Usage:
     export OPENROUTER_API_KEY=...
@@ -15,6 +20,13 @@ Usage:
     python annotation_pipeline/annotate.py \\
         --input data/generations.jsonl \\
         --output data/annotated.jsonl
+
+    # Anthropic Message Batch (lower cost vs real-time; no concurrent cap)
+    export ANTHROPIC_API_KEY=...
+    python annotation_pipeline/annotate.py \\
+        --input data/generations.jsonl \\
+        --output data/annotated.jsonl \\
+        --backend anthropic --batch --model claude-sonnet-4-20250514
 
     # From Supabase (see annotation_pipeline/downloader.py)
     export SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=...  # or SUPABASE_KEY / anon key
@@ -24,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import math
@@ -39,6 +52,7 @@ import httpx
 from dotenv import load_dotenv
 from pydantic import TypeAdapter
 from pydantic_core import from_json
+from rapidfuzz import fuzz as _rfuzz
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -51,6 +65,9 @@ log = logging.getLogger(__name__)
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 # Single system prompt for policy-span auditing (must match PolicyViolationSpan in data_models.py).
 SYSTEM_PROMPT = (_PROMPTS_DIR / "policy_violation.txt").read_text(encoding="utf-8").strip()
+
+_DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
+_DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 
 def _openrouter_chat_url() -> str:
     """URL for POST chat completions.
@@ -73,6 +90,23 @@ def _openrouter_chat_url() -> str:
     return raw
 
 
+def _resolve_model(backend: str, model: Optional[str]) -> str:
+    """Resolve backend-appropriate model defaults and normalize simple aliases."""
+    if model and str(model).strip():
+        resolved = str(model).strip()
+    elif backend == "openrouter":
+        resolved = os.environ.get("OPENROUTER_ANNOTATOR_MODEL", "").strip() or _DEFAULT_OPENROUTER_MODEL
+    elif backend == "anthropic":
+        resolved = os.environ.get("ANTHROPIC_ANNOTATOR_MODEL", "").strip() or _DEFAULT_ANTHROPIC_MODEL
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
+
+    if backend == "anthropic" and resolved.startswith("anthropic/"):
+        resolved = resolved.removeprefix("anthropic/")
+
+    return resolved
+
+
 def _format_user_message(policy: str, question: str, completion: str) -> str:
     return (
         f"Policy:\n<policy>{policy}</policy>\n\n"
@@ -82,21 +116,8 @@ def _format_user_message(policy: str, question: str, completion: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fuzzy span matching (aligned with glm5 hallucination annotate.py)
+# Fuzzy span matching (RapidFuzz only; used heavily — keep hot path in workers)
 # ---------------------------------------------------------------------------
-
-try:
-    from rapidfuzz import fuzz as _rfuzz
-    _HAS_RAPIDFUZZ = True
-except ImportError:
-    _rfuzz = None  # type: ignore[assignment]
-    _HAS_RAPIDFUZZ = False
-
-try:
-    from rouge_score import rouge_scorer as _rs_mod
-    _ROUGE = _rs_mod.RougeScorer(["rougeL"], use_stemmer=False)
-except ImportError:
-    _ROUGE = None
 
 
 def _norm(text: str) -> str:
@@ -107,13 +128,13 @@ def _norm(text: str) -> str:
 
 
 def _trim_edges(query: str, match: str, use_norm: bool = False) -> str:
-    if not match or match == query or _ROUGE is None:
+    if not match or match == query:
         return match
 
     def _score(q: str, m: str) -> float:
         if use_norm:
-            return _ROUGE.score(_norm(q), _norm(m))["rougeL"].recall
-        return _ROUGE.score(q, m)["rougeL"].recall
+            return _rfuzz.ratio(_norm(q), _norm(m)) / 100.0
+        return _rfuzz.ratio(q, m) / 100.0
 
     best, best_r = match, _score(query, match)
     for i in range(1, min(len(match) // 2, 20)):
@@ -142,9 +163,6 @@ def _find_closest(
     if query in text:
         return query
 
-    if not _HAS_RAPIDFUZZ and _ROUGE is None:
-        return None
-
     qlen = len(query)
     nq = _norm(query) if use_norm else query
     best_s, best_sub = -math.inf, ""
@@ -156,10 +174,7 @@ def _find_closest(
                 break
             cand = text[start:end].strip()
             nc = _norm(cand) if use_norm else cand
-            if _HAS_RAPIDFUZZ:
-                score = _rfuzz.ratio(nq, nc) / 100.0
-            else:
-                score = _ROUGE.score(nq, nc)["rougeL"].fmeasure  # type: ignore[union-attr]
+            score = _rfuzz.ratio(nq, nc) / 100.0
             if score > best_s:
                 best_s, best_sub = score, cand
             if best_s > 0.95:
@@ -233,6 +248,334 @@ def _assign_positions(
         cur_idx = max(cur_idx, idx + len(closest))
 
     return results
+
+
+def _should_skip_write_after_assignment(
+    rec_id: str,
+    parsed_spans: list[PolicyViolationSpan],
+    assigned_spans: list[PolicyViolationSpan],
+) -> bool:
+    """Do not write records where the model found spans but none could be aligned."""
+    if parsed_spans and not assigned_spans:
+        log.error(
+            "All %d parsed span(s) were dropped during position assignment for id=%s; not writing record",
+            len(parsed_spans),
+            rec_id,
+        )
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Anthropic batch backend (aligned with glm5_hallucination_probes/annotate.py)
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_batch(client, batch_id: str) -> None:
+    """Best-effort batch cancellation — errors are logged, not raised."""
+    try:
+        await client.messages.batches.cancel(batch_id)
+        print(f"Batch {batch_id} cancellation requested.")
+    except Exception as e:
+        print(f"Warning: could not cancel batch {batch_id}: {e}")
+
+
+async def _run_anthropic_batch(
+    to_do: list[GenerationRecord],
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    output_path: Path,
+    poll_interval: float = 60.0,
+    max_retries: int = 8,
+) -> int:
+    """Submit all records as a single Anthropic Message Batch, poll until done, write results.
+
+    Saves a sidecar ``<output>.batch_state.json`` so that a killed run can resume
+    against the already-submitted batch rather than re-submitting.
+
+    Ctrl+C behaviour matches glm5: during polling, batch keeps running; re-run to resume.
+    """
+    import anthropic  # lazy import
+
+    client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    batch_state_path = output_path.with_suffix(".batch_state.json")
+
+    batch_id: Optional[str] = None
+    submitted_ids: list[str] = []
+
+    if batch_state_path.exists():
+        try:
+            state = json.loads(batch_state_path.read_text())
+            batch_id = state.get("batch_id")
+            submitted_ids = state.get("submitted_ids", [])
+            print(f"Resuming existing batch {batch_id} ({len(submitted_ids)} records submitted)")
+        except Exception as e:
+            log.warning("Could not read batch state file (%s); will resubmit.", e)
+
+    _id_counts: dict[str, int] = {}
+    custom_id_to_rec: dict[str, GenerationRecord] = {}
+    for rec in to_do:
+        count = _id_counts.get(rec.id, 0)
+        _id_counts[rec.id] = count + 1
+        custom_id = rec.id if count == 0 else f"{rec.id}-{count}"
+        custom_id_to_rec[custom_id] = rec
+
+    if batch_id is None:
+        n_dupes = sum(v - 1 for v in _id_counts.values() if v > 1)
+        if n_dupes:
+            print(f"NOTE: {n_dupes} duplicate question IDs disambiguated with ':N' suffix for batch submission.")
+
+        requests = []
+        for custom_id, rec in custom_id_to_rec.items():
+            requests.append({
+                "custom_id": custom_id,
+                "params": {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "system": [{
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    "messages": [{
+                        "role": "user",
+                        "content": _format_user_message(rec.policy, rec.question, rec.completion),
+                    }],
+                },
+            })
+
+        try:
+            for attempt in range(max_retries):
+                try:
+                    batch = await client.messages.batches.create(requests=requests)
+                    batch_id = batch.id
+                    submitted_ids = list(custom_id_to_rec.keys())
+                    break
+                except anthropic.APIStatusError as e:
+                    if e.status_code in (429, 529) and attempt < max_retries - 1:
+                        wait = 2**attempt
+                        print(
+                            f"Rate limited submitting batch (attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {wait}s…"
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+                except anthropic.APIConnectionError:
+                    if attempt < max_retries - 1:
+                        wait = 2**attempt
+                        print(
+                            f"Connection error submitting batch (attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {wait}s…"
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            if batch_id is not None:
+                print("\nInterrupted during submission — cancelling batch…")
+                await _cancel_batch(client, batch_id)
+                if batch_state_path.exists():
+                    batch_state_path.unlink()
+            raise KeyboardInterrupt
+
+        batch_state_path.write_text(json.dumps({"batch_id": batch_id, "submitted_ids": submitted_ids}))
+        print(f"Batch submitted: {batch_id} ({len(submitted_ids)} records)")
+
+    print(f"Polling batch {batch_id} every {poll_interval:.0f}s…")
+    print("(Ctrl+C will stop polling and exit — the batch keeps running. Re-run to resume.)")
+    print("(To cancel the batch entirely, use: --cancel-batch)")
+
+    try:
+        while True:
+            for attempt in range(max_retries):
+                try:
+                    batch = await client.messages.batches.retrieve(batch_id)
+                    break
+                except anthropic.APIStatusError as e:
+                    if e.status_code in (429, 529) and attempt < max_retries - 1:
+                        wait = 2**attempt
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+                except anthropic.APIConnectionError:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2**attempt)
+                    else:
+                        raise
+
+            counts = batch.request_counts
+            print(
+                f"  [{batch.processing_status}] "
+                f"processing={counts.processing} "
+                f"succeeded={counts.succeeded} "
+                f"errored={counts.errored} "
+                f"canceled={counts.canceled} "
+                f"expired={counts.expired}"
+            )
+
+            if batch.processing_status == "ended":
+                break
+
+            await asyncio.sleep(poll_interval)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(
+            f"\nPolling stopped. Batch {batch_id} is still processing on Anthropic's servers.\n"
+            f"Re-run the same command to resume polling and collect results.\n"
+            f"State saved to: {batch_state_path}\n"
+            f"To cancel the batch, run with: --cancel-batch"
+        )
+        raise KeyboardInterrupt
+
+    n_written = 0
+    n_errors = 0
+
+    try:
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ProcessPoolExecutor(max_workers=12) as executor:
+            with open(output_path, "a") as out_f:
+                for attempt in range(max_retries):
+                    try:
+                        pending: list[tuple] = []
+
+                        with tqdm(total=len(custom_id_to_rec), desc="Streaming results", unit="rec") as pbar:
+                            async for result in await client.messages.batches.results(batch_id):
+                                rec = custom_id_to_rec.get(result.custom_id)
+                                if rec is None:
+                                    log.warning("Unknown custom_id in batch results: %s", result.custom_id)
+                                    pbar.update(1)
+                                    continue
+
+                                result_type = result.result.type
+                                if result_type == "succeeded":
+                                    response = result.result.message
+                                    text_parts = [b.text for b in response.content if b.type == "text"]
+                                    if not text_parts:
+                                        log.error("No text block in batch result for id=%s", rec.id)
+                                        n_errors += 1
+                                    else:
+                                        try:
+                                            spans = _parse_spans("\n".join(text_parts))
+                                            fut = loop.run_in_executor(
+                                                executor, _assign_positions, spans, rec.completion
+                                            )
+                                            pending.append((fut, rec, spans))
+                                        except Exception as e:
+                                            log.error("Parse failed for id=%s: %s", rec.id, e)
+                                            n_errors += 1
+                                elif result_type == "errored":
+                                    log.error("Batch request errored for id=%s: %s", rec.id, result.result.error)
+                                    n_errors += 1
+                                elif result_type == "expired":
+                                    log.error("Batch request expired for id=%s", rec.id)
+                                    n_errors += 1
+                                pbar.update(1)
+
+                        with tqdm(total=len(pending), desc="Assigning positions", unit="rec") as pbar:
+                            for fut, rec, parsed_spans in pending:
+                                try:
+                                    assigned_spans = await fut
+                                    if _should_skip_write_after_assignment(rec.id, parsed_spans, assigned_spans):
+                                        n_errors += 1
+                                        pbar.update(1)
+                                        pbar.set_postfix(written=n_written, errors=n_errors)
+                                        continue
+                                    rec.annotations = assigned_spans
+                                    rec.annotator_model = model
+                                    out_f.write(rec.model_dump_json(exclude_none=False) + "\n")
+                                    out_f.flush()
+                                    n_written += 1
+                                except Exception as e:
+                                    log.error("Position assignment failed for id=%s: %s", rec.id, e)
+                                    n_errors += 1
+                                pbar.update(1)
+                                pbar.set_postfix(written=n_written, errors=n_errors)
+
+                        break
+                    except anthropic.APIStatusError as e:
+                        if e.status_code in (429, 529) and attempt < max_retries - 1:
+                            wait = 2**attempt
+                            print(
+                                f"Rate limited fetching results (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {wait}s…"
+                            )
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
+                    except anthropic.APIConnectionError:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2**attempt)
+                        else:
+                            raise
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(
+            f"\nInterrupted while collecting results. Batch {batch_id} is complete on Anthropic's servers.\n"
+            f"Re-run the same command to collect the remaining results."
+        )
+        raise KeyboardInterrupt
+
+    print(f"Batch complete: {n_written} written, {n_errors} errors/expired.")
+
+    if batch_state_path.exists():
+        batch_state_path.unlink()
+
+    return n_written
+
+
+async def _annotate_anthropic(
+    policy: str,
+    question: str,
+    completion: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    semaphore: asyncio.Semaphore,
+    max_retries: int = 5,
+) -> list[PolicyViolationSpan]:
+    """Single-request Anthropic Messages API (non-batch)."""
+    import anthropic  # lazy import
+
+    client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    user_content = _format_user_message(policy, question, completion)
+
+    for attempt in range(max_retries):
+        try:
+            async with semaphore:
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=[{
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    messages=[{"role": "user", "content": user_content}],
+                )
+            break
+        except anthropic.APIStatusError as e:
+            if e.status_code in (429, 529) and attempt < max_retries - 1:
+                wait = 2**attempt
+                print(f"Claude rate limited/overloaded (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+        except anthropic.APIConnectionError:
+            if attempt < max_retries - 1:
+                wait = 2**attempt
+                print(f"Connection error (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+    text_parts = [b.text for b in response.content if b.type == "text"]
+    if not text_parts:
+        raise ValueError("Anthropic response contained no text block")
+    response_text = "\n".join(text_parts)
+    return _parse_spans(response_text)
 
 
 async def _annotate_openrouter(
@@ -326,8 +669,7 @@ async def _annotate_openrouter(
         raise last_err  # pragma: no cover
 
     response_text: str = resp.json()["choices"][0]["message"]["content"]
-    spans = _parse_spans(response_text)
-    return _assign_positions(spans, completion)
+    return _parse_spans(response_text)
 
 
 def _load_records_from_jsonl(path: Path) -> list[GenerationRecord]:
@@ -344,19 +686,33 @@ def _load_records_from_jsonl(path: Path) -> list[GenerationRecord]:
 
 def run(
     output_path: Path,
-    model: str,
+    model: Optional[str] = None,
     input_path: Optional[Path] = None,
     from_supabase: bool = False,
     supabase_table: Optional[str] = None,
     supabase_limit: Optional[int] = None,
+    backend: str = "openrouter",
     max_tokens: int = 8192,
     temperature: float = 0.0,
     max_concurrent: int = 3,
     num_items: Optional[int] = None,
+    use_batch: bool = False,
+    batch_poll_interval: float = 60.0,
 ) -> int:
     """Annotate completions. Returns number of records written."""
-    if not os.environ.get("OPENROUTER_API_KEY", "").strip():
-        raise SystemExit("OPENROUTER_API_KEY is not set or is empty.")
+    if use_batch and backend != "anthropic":
+        raise ValueError("--batch is only supported with --backend anthropic.")
+
+    model = _resolve_model(backend, model)
+
+    if backend == "openrouter":
+        if not os.environ.get("OPENROUTER_API_KEY", "").strip():
+            raise SystemExit("OPENROUTER_API_KEY is not set or is empty.")
+    elif backend == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+            raise SystemExit("ANTHROPIC_API_KEY is not set or is empty.")
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
     if from_supabase:
         table = supabase_table if supabase_table is not None else default_generations_table()
@@ -372,9 +728,8 @@ def run(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Any line in the output file with an id counts as done (resume-safe). Do not
-    # require ``annotations`` to be non-null: empty or missing annotations still
-    # mean "this prompt was already processed" for the same id.
+    # Skip rows that already have annotations in the output (same rule as glm5 batch annotate).
+    # Lines without ``annotations`` (failed/partial runs) are not treated as done.
     done_ids: set[str] = set()
     if output_path.exists():
         with open(output_path) as f:
@@ -384,13 +739,12 @@ def run(
                     continue
                 try:
                     rec = json.loads(line)
-                    oid = rec.get("id")
-                    if oid is not None and str(oid).strip():
-                        done_ids.add(str(oid))
+                    if "id" in rec and rec.get("annotations") is not None:
+                        done_ids.add(str(rec["id"]))
                 except json.JSONDecodeError:
                     pass
         if done_ids:
-            log.info("Resuming: %d id(s) already in %s", len(done_ids), output_path)
+            log.info("Resuming: %d record(s) already annotated in %s", len(done_ids), output_path)
 
     to_do = [r for r in records if r.id not in done_ids and r.completion]
     print(f"Records to annotate: {len(to_do)}")
@@ -399,45 +753,93 @@ def run(
         return 0
 
     async def _run_all() -> int:
+        if use_batch:
+            return await _run_anthropic_batch(
+                to_do=to_do,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                output_path=output_path,
+                poll_interval=batch_poll_interval,
+            )
+
         semaphore = asyncio.Semaphore(max_concurrent)
         n_written = 0
         t0 = time.monotonic()
+        assign_workers = min(12, max(1, (os.cpu_count() or 4)))
+        loop = asyncio.get_running_loop()
 
-        async def _process(rec: GenerationRecord) -> Optional[GenerationRecord]:
-            try:
-                spans = await _annotate_openrouter(
-                    rec.policy,
-                    rec.question,
-                    rec.completion,
-                    model,
-                    max_tokens,
-                    temperature,
-                    http_client,
-                    semaphore,
-                )
-                rec.annotations = spans
-                rec.annotator_model = model
-                return rec
-            except Exception as e:
-                log.error("Annotation failed for id=%s: %s", rec.id, e)
-                return None
+        # CPU-heavy span → index alignment runs in worker processes (same idea as batch retrieval).
+        with concurrent.futures.ProcessPoolExecutor(max_workers=assign_workers) as assign_executor:
 
-        async with httpx.AsyncClient() as http_client:
-            tasks = [asyncio.create_task(_process(r)) for r in to_do]
-            with open(output_path, "a") as out_f:
-                with tqdm(total=len(tasks), desc="Annotating", unit="rec") as pbar:
-                    for fut in asyncio.as_completed(tasks):
-                        result = await fut
-                        if result is not None:
-                            out_f.write(result.model_dump_json(exclude_none=False) + "\n")
-                            out_f.flush()
-                            n_written += 1
-                        elapsed = time.monotonic() - t0
-                        pbar.set_postfix(
-                            written=n_written,
-                            r_s=f"{n_written/elapsed:.1f}" if elapsed else "?",
+            async def _process(rec: GenerationRecord) -> Optional[GenerationRecord]:
+                try:
+                    if backend == "anthropic":
+                        spans = await _annotate_anthropic(
+                            rec.policy,
+                            rec.question,
+                            rec.completion,
+                            model,
+                            max_tokens,
+                            temperature,
+                            semaphore,
                         )
-                        pbar.update(1)
+                    else:
+                        spans = await _annotate_openrouter(
+                            rec.policy,
+                            rec.question,
+                            rec.completion,
+                            model,
+                            max_tokens,
+                            temperature,
+                            http_client,
+                            semaphore,
+                        )
+                    assigned_spans = await loop.run_in_executor(
+                        assign_executor, _assign_positions, spans, rec.completion
+                    )
+                    if _should_skip_write_after_assignment(rec.id, spans, assigned_spans):
+                        return None
+                    rec.annotations = assigned_spans
+                    rec.annotator_model = model
+                    return rec
+                except Exception as e:
+                    log.error("Annotation failed for id=%s: %s", rec.id, e)
+                    return None
+
+            if backend == "openrouter":
+                async with httpx.AsyncClient() as http_client:
+                    tasks = [asyncio.create_task(_process(r)) for r in to_do]
+                    with open(output_path, "a") as out_f:
+                        with tqdm(total=len(tasks), desc="Annotating", unit="rec") as pbar:
+                            for fut in asyncio.as_completed(tasks):
+                                result = await fut
+                                if result is not None:
+                                    out_f.write(result.model_dump_json(exclude_none=False) + "\n")
+                                    out_f.flush()
+                                    n_written += 1
+                                elapsed = time.monotonic() - t0
+                                pbar.set_postfix(
+                                    written=n_written,
+                                    r_s=f"{n_written/elapsed:.1f}" if elapsed else "?",
+                                )
+                                pbar.update(1)
+            else:
+                tasks = [asyncio.create_task(_process(r)) for r in to_do]
+                with open(output_path, "a") as out_f:
+                    with tqdm(total=len(tasks), desc="Annotating", unit="rec") as pbar:
+                        for fut in asyncio.as_completed(tasks):
+                            result = await fut
+                            if result is not None:
+                                out_f.write(result.model_dump_json(exclude_none=False) + "\n")
+                                out_f.flush()
+                                n_written += 1
+                            elapsed = time.monotonic() - t0
+                            pbar.set_postfix(
+                                written=n_written,
+                                r_s=f"{n_written/elapsed:.1f}" if elapsed else "?",
+                            )
+                            pbar.update(1)
         return n_written
 
     try:
@@ -477,15 +879,40 @@ def run(
 )
 @click.option("--output", "output_path", default="data/annotated.jsonl", type=click.Path(path_type=Path))
 @click.option(
+    "--backend",
+    default="openrouter",
+    type=click.Choice(["openrouter", "anthropic"]),
+    help="openrouter: chat completions API. anthropic: Claude Messages API or Message Batch (--batch).",
+)
+@click.option(
     "--model",
     default=None,
-    envvar="OPENROUTER_ANNOTATOR_MODEL",
-    help="OpenRouter model id (required). Env OPENROUTER_ANNOTATOR_MODEL if flag omitted.",
+    help="Annotator model id. Defaults to OPENROUTER_ANNOTATOR_MODEL or openai/gpt-4o-mini "
+    "for openrouter, and ANTHROPIC_ANNOTATOR_MODEL or claude-sonnet-4-20250514 for anthropic.",
 )
 @click.option("--max-tokens", default=8192)
 @click.option("--temperature", default=0.0)
 @click.option("--max-concurrent", default=3)
 @click.option("--num-items", default=None, type=int)
+@click.option(
+    "--batch",
+    "use_batch",
+    is_flag=True,
+    default=False,
+    help="Use Anthropic Message Batch API (lower cost, async). Only with --backend anthropic.",
+)
+@click.option(
+    "--batch-poll-interval",
+    default=60.0,
+    type=float,
+    help="Seconds between batch status polls (batch mode only).",
+)
+@click.option(
+    "--cancel-batch",
+    is_flag=True,
+    default=False,
+    help="Cancel the in-progress batch in <output>.batch_state.json, then exit.",
+)
 @click.option("--verbose", "-v", is_flag=True)
 def main(
     input_path: Optional[Path],
@@ -493,35 +920,60 @@ def main(
     supabase_table: Optional[str],
     supabase_limit: Optional[int],
     output_path: Path,
+    backend: str,
     model: Optional[str],
     max_tokens: int,
     temperature: float,
     max_concurrent: int,
     num_items: Optional[int],
+    use_batch: bool,
+    batch_poll_interval: float,
+    cancel_batch: bool,
     verbose: bool,
 ) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    if cancel_batch:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise SystemExit("ANTHROPIC_API_KEY not set.")
+        batch_state_path = Path(output_path).with_suffix(".batch_state.json")
+        if not batch_state_path.exists():
+            raise SystemExit(f"No batch state file found at {batch_state_path}. Nothing to cancel.")
+        state = json.loads(batch_state_path.read_text())
+        batch_id = state.get("batch_id")
+        if not batch_id:
+            raise SystemExit("batch_state.json has no batch_id. Nothing to cancel.")
+
+        import anthropic
+
+        async def _do_cancel() -> None:
+            client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+            await _cancel_batch(client, batch_id)
+            batch_state_path.unlink()
+            print(f"State file {batch_state_path} removed.")
+
+        asyncio.run(_do_cancel())
+        return
+
     if not supabase and input_path is None:
         raise SystemExit("Provide --input PATH.jsonl or use --supabase.")
-    if not model or not str(model).strip():
-        raise SystemExit(
-            "Set --model MODEL or OPENROUTER_ANNOTATOR_MODEL to an OpenRouter model id "
-            "(e.g. openai/gpt-4o-mini). See https://openrouter.ai/models"
-        )
     run(
         output_path=output_path,
-        model=str(model).strip(),
+        model=model,
         input_path=input_path,
         from_supabase=supabase,
         supabase_table=supabase_table,
         supabase_limit=supabase_limit,
+        backend=backend,
         max_tokens=max_tokens,
         temperature=temperature,
         max_concurrent=max_concurrent,
         num_items=num_items,
+        use_batch=use_batch,
+        batch_poll_interval=batch_poll_interval,
     )
 
 

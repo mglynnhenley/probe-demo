@@ -24,11 +24,29 @@ lora_present: false
 lora_path: output/lora_adapter/
 
 # ── Probe head ─────────────────────────────────────────────────────────────
-# Must match the base model hidden size (e.g. 4096 for Llama 3.1 8B).
-hidden_size: 4096
+probe:
+  # Train either the original per-token MLP or the covariance-pooled sequence model.
+  probe_model_type: mlp
 
-# Empty list = linear probe; e.g. [1024] for one hidden MLP layer
-probe_hidden_sizes: []
+  # Resolved from the base model config at runtime; leave as 0 unless debugging.
+  hidden_size: 0
+
+  # Empty list = linear probe; e.g. [1024] for one hidden MLP layer.
+  hidden_sizes: []
+
+  output_size: 1
+
+  covseq:
+    # Each token is scored from the previous `window_size` completion tokens,
+    # truncated near the start instead of padded.
+    window_size: 8
+
+    # Rank of the compressed covariance features.
+    compressed_size: 64
+
+    # If the probe model defines `training_metrics(X)`, print those diagnostics
+    # every N epochs using a recent covseq batch. Set <= 0 to disable.
+    training_metrics_interval_epochs: 1.0
 
 # ── Data ───────────────────────────────────────────────────────────────────
 # JSONL from annotation_pipeline (see annotation_pipeline/README.md).

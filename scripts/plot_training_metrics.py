@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -170,6 +171,124 @@ def plot_metrics(
     return fig
 
 
+def _last_finite(values: List[float]) -> float | None:
+    for value in reversed(values):
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _best_by_max(rows: List[tuple], value_idx: int) -> tuple[int, float] | None:
+    best: tuple[int, float] | None = None
+    for row in rows:
+        value = float(row[value_idx])
+        if not math.isfinite(value):
+            continue
+        step = int(row[0])
+        if best is None or value > best[1]:
+            best = (step, value)
+    return best
+
+
+def _best_by_min(rows: List[tuple], value_idx: int) -> tuple[int, float] | None:
+    best: tuple[int, float] | None = None
+    for row in rows:
+        value = float(row[value_idx])
+        if not math.isfinite(value):
+            continue
+        step = int(row[0])
+        if best is None or value < best[1]:
+            best = (step, value)
+    return best
+
+
+def build_summary_text(
+    summary: Dict[str, Any],
+    loss_data: List[tuple],
+    probe_data: List[tuple],
+    eval_data: List[tuple],
+    *,
+    source_path: Path,
+) -> str:
+    lines: List[str] = []
+    lines.append(f"Run: {source_path.parent.name}/{source_path.name}")
+    lines.append(
+        "Summary: "
+        f"global_step={summary.get('global_step')}  "
+        f"epoch={summary.get('epoch')}  "
+        f"best_metric={summary.get('best_metric')}  "
+        f"best_model_checkpoint={summary.get('best_model_checkpoint')}"
+    )
+    lines.append(
+        f"Points: loss={len(loss_data)}  train_probe={len(probe_data)}  eval={len(eval_data)}"
+    )
+
+    if loss_data:
+        final_step = int(loss_data[-1][0])
+        final_loss = float(loss_data[-1][1])
+        final_lr = _last_finite([float(x[2]) for x in loss_data])
+        final_grad_norm = _last_finite([float(x[3]) for x in loss_data])
+        best_loss = _best_by_min(loss_data, 1)
+        final_lr_s = f"{final_lr:.6g}" if final_lr is not None else "nan"
+        lines.append("")
+        lines.append("Train loss:")
+        lines.append(
+            f"final step={final_step}  loss={final_loss:.6f}  "
+            f"lr={final_lr_s}"
+        )
+        if final_grad_norm is not None:
+            lines.append(f"final grad_norm={final_grad_norm:.6f}")
+        if best_loss is not None:
+            lines.append(f"best loss={best_loss[1]:.6f} at step={best_loss[0]}")
+
+    if probe_data:
+        final = probe_data[-1]
+        best_f1 = _best_by_max(probe_data, 1)
+        best_tpr = _best_by_max(probe_data, 4)
+        lines.append("")
+        lines.append("Train probe metrics:")
+        lines.append(
+            f"final step={int(final[0])}  f1={float(final[1]):.6f}  "
+            f"token_accuracy={float(final[2]):.6f}  "
+            f"prec_viol={float(final[3]):.6f}  "
+            f"tpr={float(final[4]):.6f}  "
+            f"frac_pred_viol={float(final[5]):.6f}"
+        )
+        lines.append(
+            f"final batch token counts: violation={int(final[6])}  nonviolation={int(final[7])}"
+        )
+        if best_f1 is not None:
+            lines.append(f"best train f1={best_f1[1]:.6f} at step={best_f1[0]}")
+        if best_tpr is not None:
+            lines.append(f"best train tpr={best_tpr[1]:.6f} at step={best_tpr[0]}")
+
+    if eval_data:
+        final = eval_data[-1]
+        best_eval_f1 = _best_by_max(eval_data, 2)
+        best_eval_loss = _best_by_min(eval_data, 1)
+        lines.append("")
+        lines.append("Evaluation:")
+        lines.append(
+            f"final step={int(final[0])}  eval_loss={float(final[1]):.6f}  "
+            f"eval_f1={float(final[2]):.6f}  "
+            f"eval_token_accuracy={float(final[3]):.6f}  "
+            f"eval_precision_viol={float(final[4]):.6f}  "
+            f"eval_tpr={float(final[5]):.6f}  "
+            f"eval_tnr={float(final[6]):.6f}  "
+            f"eval_baseline_nonviol_acc={float(final[7]):.6f}"
+        )
+        if best_eval_f1 is not None:
+            lines.append(f"best eval_f1={best_eval_f1[1]:.6f} at step={best_eval_f1[0]}")
+        if best_eval_loss is not None:
+            lines.append(f"best eval_loss={best_eval_loss[1]:.6f} at step={best_eval_loss[0]}")
+    else:
+        lines.append("")
+        lines.append("Evaluation:")
+        lines.append("no eval entries")
+
+    return "\n".join(lines)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Plot training_metrics.json curves.")
     p.add_argument(
@@ -203,7 +322,19 @@ def main() -> None:
     title = f"{path.parent.name} / {path.name}"
     fig = plot_metrics(summary, loss_data, probe_data, eval_data, title=title)
     fig.savefig(out, dpi=args.dpi)
+    summary_text = build_summary_text(
+        summary,
+        loss_data,
+        probe_data,
+        eval_data,
+        source_path=path,
+    )
+    summary_out = out.with_name(f"{out.stem}_summary.txt")
+    summary_out.write_text(summary_text + "\n", encoding="utf-8")
+    print(summary_text)
+    print("")
     print(f"Wrote {out}")
+    print(f"Wrote {summary_out}")
 
 
 if __name__ == "__main__":
