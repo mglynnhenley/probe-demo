@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import os
 import threading
 import time
 import uuid
-from typing import Any, AsyncGenerator, Generator, Optional
+from typing import Any, AsyncGenerator, Generator
 
 import uvicorn
 import uvloop
@@ -29,7 +28,6 @@ from api.schemas import (
     DeltaMessage,
     ModelCard,
     ModelList,
-    ProbeScore,
 )
 from service import get_service, lifespan
 
@@ -52,7 +50,7 @@ async def _stream_sync_gen(
     on_disconnect=None,
 ) -> AsyncGenerator[str, None]:
     """Run a blocking sync generator on a thread pool, yielding SSE strings."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
     _DONE = object()
 
@@ -60,6 +58,9 @@ async def _stream_sync_gen(
         try:
             for item in gen:
                 loop.call_soon_threadsafe(q.put_nowait, item)
+        except Exception as exc:
+            import traceback
+            print(f"[STREAM] generator error: {exc}\n{traceback.format_exc()}", flush=True)
         finally:
             loop.call_soon_threadsafe(q.put_nowait, _DONE)
 
@@ -123,6 +124,7 @@ def _build_chunks(
     yield _chunk_to_sse(first_chunk)
 
     messages = [m.model_dump() for m in request.messages]
+    probes = svc.get_probes(request.probe_path) if request.include_scores else []
 
     for delta, token_index, per_layer in svc.generate_streaming(
         messages=messages,
@@ -130,19 +132,18 @@ def _build_chunks(
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         top_p=request.top_p,
-        include_probe_scores=request.include_probe_scores,
+        include_probe_scores=request.include_scores,
         cancel_event=cancel_event,
     ):
         if delta is None:
             # Completion sentinel — emit [DONE]
             break
 
-        probe_scores: list[ProbeScore] | None = None
+        scores: dict[str, float] | None = None
         if per_layer:
-            probe_scores = [
-                ProbeScore(layer=layer, score=score, token_index=token_index)
-                for layer, score in per_layer
-            ]
+            # per_layer is [(layer_idx, score), ...] — one entry per probe.
+            # Zip with probe names to produce {name: score}.
+            scores = {name: score for (name, _), (_, score) in zip(probes, per_layer)}
 
         chunk = ChatCompletionChunk(
             id=completion_id,
@@ -151,7 +152,7 @@ def _build_chunks(
             choices=[ChatCompletionChunkChoice(
                 delta=DeltaMessage(content=delta),
             )],
-            probe_scores=probe_scores,
+            scores=scores,
         )
         yield _chunk_to_sse(chunk)
 
@@ -198,6 +199,15 @@ def list_models() -> ModelList:
     return ModelList(data=[ModelCard(id=svc.model_name)])
 
 
+@app.get("/v1/models/{model_id:path}")
+def retrieve_model(model_id: str) -> ModelCard:
+    svc = get_service()
+    from fastapi import HTTPException
+    if model_id != svc.model_name:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    return ModelCard(id=svc.model_name)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -218,9 +228,10 @@ async def chat_completions(
     # Non-streaming: collect all tokens then return
     svc = get_service()
     messages = [m.model_dump() for m in request.messages]
+    probes = svc.get_probes(request.probe_path) if request.include_scores else []
     all_text: list[str] = []
-    all_probe_probs: list[float] = []
-    all_probe_scores: list[list[ProbeScore]] = []
+    # scores_by_probe accumulates one float per token for each probe
+    scores_by_probe: dict[str, list[float]] = {name: [] for name, _ in probes}
 
     for delta, token_index, per_layer in svc.generate_streaming(
         messages=messages,
@@ -228,24 +239,27 @@ async def chat_completions(
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         top_p=request.top_p,
-        include_probe_scores=request.include_probe_scores,
+        include_probe_scores=request.include_scores,
     ):
         if delta is None:
             break
         all_text.append(delta)
         if per_layer:
-            scores = [
-                ProbeScore(layer=layer, score=score, token_index=token_index or 0)
-                for layer, score in per_layer
-            ]
-            # Aggregate to a single prob (mean across layers) for the flat list
-            all_probe_probs.append(sum(s.score for s in scores) / len(scores))
-            all_probe_scores.append(scores)
+            for (name, _), (_, score) in zip(probes, per_layer):
+                scores_by_probe[name].append(score)
 
     generated_text = "".join(all_text)
 
     prompt_tokens = len(svc.tokenizer.encode("".join(m.content for m in request.messages)))
     completion_tokens = len(svc.tokenizer.encode(generated_text, add_special_tokens=False))
+
+    scores: dict[str, list[float]] | None = None
+    if request.include_scores and scores_by_probe:
+        assert all(len(v) == completion_tokens for v in scores_by_probe.values()), (
+            f"Score array length mismatch: expected {completion_tokens} tokens, "
+            f"got {{{', '.join(f'{k}: {len(v)}' for k, v in scores_by_probe.items())}}}"
+        )
+        scores = scores_by_probe
 
     return ChatCompletion(
         id=completion_id,
@@ -259,8 +273,7 @@ async def chat_completions(
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         ),
-        probe_probs=all_probe_probs if request.include_probe_scores else None,
-        probe_scores=all_probe_scores if request.include_probe_scores else None,
+        scores=scores,
     )
 
 

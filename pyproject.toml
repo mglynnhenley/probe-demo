@@ -3,7 +3,7 @@ name = "probe-demo"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
     "vllm-probe-plugin",
@@ -23,6 +23,9 @@ dependencies = [
     "transformers>=5.5.0",
     "numpy>=1.26",
     "matplotlib>=3.10.8",
+    "trl>=0.17",
+    "unsloth>=2025.4",
+    "deepspeed>=0.18.9",
 ]
 
 [tool.setuptools.packages.find]

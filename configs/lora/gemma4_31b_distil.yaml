@@ -1,0 +1,50 @@
+# SFT-distil Gemma 4 31B dense to match GPT-5.4-Nano completion patterns.
+# Run: uv run python train_unsloth/train.py configs/gemma4_31b_distil.yaml
+
+# ── Model ──────────────────────────────────────────────────────────────────
+model_name: /pool/models/hub/models--google--gemma-4-31B-it/snapshots/439edf5652646a0d1bd8b46bfdc1d3645761a445
+dtype: auto
+max_seq_len: 2048
+trust_remote_code: true
+
+# ── Chat template ──────────────────────────────────────────────────────────
+# Disable thinking mode so templates align with plain user/assistant turns.
+chat_template_kwargs:
+  enable_thinking: false
+
+# ── LoRA ───────────────────────────────────────────────────────────────────
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# ── Data ───────────────────────────────────────────────────────────────────
+generations_jsonl: data/generations.jsonl
+target_model: openai/gpt-5.4-nano
+val_fraction: 0.1
+
+# ── Training ───────────────────────────────────────────────────────────────
+epochs: 3
+train_batch_size: 2
+grad_accumulation_steps: 4
+learning_rate: 2.0e-4
+warmup_steps: 50
+max_grad_norm: 1.0
+lr_scheduler_type: cosine
+logging_steps: 5
+save_steps: 100
+
+# ── Output ─────────────────────────────────────────────────────────────────
+# Adapter saved to output/<run_name>/lora/
+run_name: gemma4_31b_distil_v1
+output_dir: output
+
+# ── Misc ───────────────────────────────────────────────────────────────────
+seed: 42

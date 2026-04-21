@@ -24,6 +24,7 @@ backups/
 
 # stored data
 data/**
+backup_data/**
 !/data/.gitkeep
 
 # development
@@ -31,3 +32,6 @@ dev_scripts/
 
 # output probes
 output/
+
+# unsloth compiled models
+unsloth_compiled_cache/

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import json
 import os
 import queue as _queue
 import sys
@@ -21,10 +23,120 @@ _TRAIN_DIR = Path(__file__).resolve().parent.parent / "train"
 if str(_TRAIN_DIR) not in sys.path:
     sys.path.insert(0, str(_TRAIN_DIR))
 
-from models import CovSeqModel, ValueHeadProbe  # noqa: E402  (added to path above)
-from config import ProbeConfig  # noqa: E402
+from models import CovSeqModel, ValueHeadProbe, ProbeConfig  # noqa: E402  (train package)
 
 _DONE = object()
+
+_KNOWN_ENV_VARS = {
+    "MODEL_NAME",
+    "PROBE_PATH",
+    "VLLM_DTYPE",
+    "VLLM_MAX_MODEL_LEN",
+    "VLLM_GPU_MEMORY_UTILIZATION",
+    "VLLM_TENSOR_PARALLEL_SIZE",
+    "VLLM_TRUST_REMOTE_CODE",
+    "HF_TOKEN",
+    "HOST",
+    "PORT",
+}
+
+
+def _warn_suspicious_env_vars() -> None:
+    """Warn if any env var looks like a typo of a known backend var."""
+    for key in os.environ:
+        if key in _KNOWN_ENV_VARS:
+            continue
+        matches = difflib.get_close_matches(key, _KNOWN_ENV_VARS, n=1, cutoff=0.8)
+        if matches:
+            print(
+                f"[WARN] Unrecognised env var {key!r} looks like a typo of {matches[0]!r}",
+                flush=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Resolve base model + training sidecar (TP, max_len, chat template kwargs)
+# ---------------------------------------------------------------------------
+
+def _expand_probe_checkpoint(raw: str) -> Path:
+    """If *raw* is a directory, prefer ``probe_head.bin`` inside it (trainer output layout)."""
+    p = Path(raw).expanduser()
+    if p.is_dir():
+        cand = p / "probe_head.bin"
+        if cand.is_file():
+            return cand
+    return p
+
+
+def _read_training_sidecar_next_to_probe(probe_file: Path) -> dict[str, Any]:
+    cfg = probe_file.parent / "config.json"
+    if not cfg.is_file():
+        return {}
+    try:
+        return json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def resolve_inference_model_and_config(raw_probe_paths: list[str]) -> tuple[str, dict[str, Any]]:
+    """Infer the Hugging Face model id from env, probe checkpoints, or training ``config.json``.
+
+    Training saves :class:`~models.ProbeConfig` with ``underlying_model`` set to the vLLM base model.
+    The run directory also contains ``config.json`` with ``model_name``, ``tensor_parallel_size``, etc.
+    """
+    env_model = (os.environ.get("MODEL_NAME") or "").strip()
+    inferred: str | None = None
+    sidecar: dict[str, Any] = {}
+
+    for raw in raw_probe_paths:
+        p = _expand_probe_checkpoint(raw)
+        if p.is_file():
+            sc = _read_training_sidecar_next_to_probe(p)
+            if sc:
+                sidecar = sc
+            try:
+                payload = torch.load(p, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and "probe_config" in payload:
+                pc = ProbeConfig.from_dict(payload["probe_config"])
+                if pc.underlying_model:
+                    inferred = pc.underlying_model
+                    break
+        elif p.is_dir() and (p / "config.json").is_file():
+            try:
+                sidecar = json.loads((p / "config.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    # Directory-only PROBE_PATH: sidecar may already have model_name
+    if not sidecar and raw_probe_paths:
+        for raw in raw_probe_paths:
+            d = Path(raw).expanduser()
+            if d.is_dir() and (d / "config.json").is_file():
+                try:
+                    sidecar = json.loads((d / "config.json").read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+                break
+
+    sidecar_model = (sidecar.get("model_name") if sidecar else None) or None
+    model = env_model or inferred or (str(sidecar_model) if sidecar_model else "")
+    if not model:
+        raise RuntimeError(
+            "Could not determine which Hugging Face model to load.\n"
+            "  • export MODEL_NAME=google/gemma-4-31B-it\n"
+            "  • or export PROBE_PATH to your probe checkpoint:\n"
+            "      export PROBE_PATH=/path/to/output/run/probe_head.bin\n"
+            "    or the training output directory containing probe_head.bin + config.json\n"
+            "The checkpoint must include probe_config.underlying_model (from training), "
+            "or sit next to config.json with \"model_name\"."
+        )
+
+    print(f"[INIT] HF model for vLLM: {model}", flush=True)
+    if env_model:
+        print("[INIT] (MODEL_NAME env overrides inferred id)", flush=True)
+    return model, sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +145,11 @@ _DONE = object()
 
 def load_probe(path: str | Path) -> ValueHeadProbe:
     """Load a ValueHeadProbe checkpoint from *path* onto CPU."""
-    path = Path(path)
+    path = _expand_probe_checkpoint(str(path))
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Probe weights not found at {path} (expected a file or a directory containing probe_head.bin)"
+        )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(payload, dict) and "probe_config" in payload:
         cfg = ProbeConfig.from_dict(payload["probe_config"])
@@ -61,16 +177,12 @@ def _run_covseq_step(
     hs: torch.Tensor,
     buf: deque,
 ) -> float:
-    T = probe.cfg.model.covseq.window_size
     vec = hs.squeeze(0).to(torch.float32)
     buf.append(vec)
-    d = vec.shape[0]
-    n_pad = T - len(buf)
-    if n_pad > 0:
-        pad = [torch.zeros(d, dtype=torch.float32)] * n_pad
-        window = torch.stack(pad + list(buf), dim=0).unsqueeze(0)
-    else:
-        window = torch.stack(list(buf), dim=0).unsqueeze(0)
+    # Use only real hidden states — training used truncated windows of length 1..T-1
+    # for early tokens, never zero-padded full windows. Zero-padding causes a 1/T
+    # scale error in the covariance matrix that produces out-of-distribution scores.
+    window = torch.stack(list(buf), dim=0).unsqueeze(0)  # [1, actual_len, d_model]
     with torch.no_grad():
         logit = probe.model(window)
         return float(torch.sigmoid(logit).squeeze())
@@ -98,13 +210,16 @@ def run_probe_step(
 class ProbeService:
     """Owns the vLLM AsyncLLM engine and a cache of loaded probes."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, training_sidecar: dict[str, Any] | None = None) -> None:
         import vllm
         import vllm_probe_plugin
         from vllm_probe_plugin import _result_bus
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from transformers import AutoTokenizer
+
+        tc = training_sidecar or {}
+        self._chat_template_kwargs: dict[str, Any] = dict(tc.get("chat_template_kwargs") or {})
 
         self.model_name = model_name
         self.tokenizer = None
@@ -134,6 +249,7 @@ class ProbeService:
         os.environ.setdefault("VLLM_RINGBUFFER_WARNING_INTERVAL", "180")
         os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
+        torch._dynamo.config.suppress_errors = True
         vllm_probe_plugin.register()
         _result_bus.start()
 
@@ -143,9 +259,19 @@ class ProbeService:
         )
         self._loop_thread.start()
 
-        dtype = os.environ.get("VLLM_DTYPE", "auto")
-        max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "32768"))
-        gpu_mem = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.9"))
+        dtype = os.environ.get("VLLM_DTYPE") or tc.get("dtype") or "auto"
+        if not isinstance(dtype, str):
+            dtype = str(dtype)
+        max_model_len = int(float(os.environ.get("VLLM_MAX_MODEL_LEN", tc.get("max_model_len", 32768))))
+        gpu_mem = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", tc.get("gpu_memory_utilization", 0.9)))
+        tensor_parallel_size = int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", tc.get("tensor_parallel_size", 1)))
+        trust_remote_code = tc.get("trust_remote_code", True)
+        if os.environ.get("VLLM_TRUST_REMOTE_CODE") is not None:
+            trust_remote_code = os.environ["VLLM_TRUST_REMOTE_CODE"].strip().lower() in (
+                "1", "true", "yes",
+            )
+
+        chunked = tc.get("enable_chunked_prefill")
 
         async def _create_llm():
             kwargs: dict[str, Any] = dict(
@@ -157,15 +283,25 @@ class ProbeService:
                 dtype=dtype,
                 max_model_len=max_model_len,
                 gpu_memory_utilization=gpu_mem,
+                tensor_parallel_size=tensor_parallel_size,
+                trust_remote_code=trust_remote_code,
                 enable_prefix_caching=True,
+                enforce_eager=True, # I'm sad about this
             )
+            if chunked is not None:
+                kwargs["enable_chunked_prefill"] = bool(chunked)
             return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))
 
         self._llm = asyncio.run_coroutine_threadsafe(_create_llm(), self._loop).result()
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, token=os.environ.get("HF_TOKEN")
+            model_name,
+            token=os.environ.get("HF_TOKEN"),
+            trust_remote_code=trust_remote_code,
         )
-        print(f"[INIT] Ready: {model_name}", flush=True)
+        print(
+            f"[INIT] Ready: {model_name} (tensor_parallel_size={tensor_parallel_size})",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Probe management
@@ -177,14 +313,25 @@ class ProbeService:
             self._probe_cache[path] = load_probe(path)
         return self._probe_cache[path]
 
-    def get_probes(self, probe_path: str | None) -> list[ValueHeadProbe]:
-        """Return the list of probes to use for a request.
+    @staticmethod
+    def _probe_name(path: str) -> str:
+        """Derive a human-readable probe name from its checkpoint path.
+
+        Uses the parent directory name when the file is probe_head.bin
+        (standard trainer output layout), otherwise the file stem.
+        """
+        p = Path(path)
+        return p.parent.name if p.name == "probe_head.bin" else p.stem
+
+    def get_probes(self, probe_path: str | None) -> list[tuple[str, ValueHeadProbe]]:
+        """Return (name, probe) pairs for a request.
 
         Priority: per-request *probe_path* → PROBE_PATH env var → empty list.
         """
         if probe_path:
-            return [self._load_probe(probe_path)]
-        return list(self._probe_cache.values())
+            resolved = str(_expand_probe_checkpoint(probe_path))
+            return [(self._probe_name(resolved), self._load_probe(probe_path))]
+        return [(self._probe_name(path), probe) for path, probe in self._probe_cache.items()]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -200,7 +347,10 @@ class ProbeService:
                 {"role": "system", "content": "You are a helpful assistant."}
             ] + list(messages)
         return self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **self._chat_template_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -242,8 +392,8 @@ class ProbeService:
         async def _run():
             prev_text = ""
             step = 0
-            # Per-probe rolling buffers for CovSeqModel (keyed by probe path).
-            buffers: dict[str, deque | None] = {pr.cfg.layer_idx: None for pr in probes}
+            # Per-probe rolling buffers for CovSeqModel (keyed by layer_idx).
+            buffers: dict[int, deque | None] = {probe.cfg.layer_idx: None for _, probe in probes}
             internal_req_id = None
             try:
                 async for output in self._llm.generate(
@@ -269,7 +419,7 @@ class ProbeService:
                         internal_req_id, step_hidden = await _result_bus.read_step_async(
                             req_id, step
                         )
-                        for probe in probes:
+                        for _, probe in probes:
                             hs = step_hidden.get(probe.cfg.layer_idx)
                             if hs is None:
                                 continue
@@ -326,8 +476,14 @@ def get_service() -> ProbeService:
 @asynccontextmanager
 async def lifespan(app):
     global _service
-    model = os.environ.get("MODEL_NAME", "meta-llama/Meta-Llama-3.1-8B-Instruct")
-    _service = ProbeService(model)
+    _warn_suspicious_env_vars()
+    raw_probe_paths = [
+        p.strip()
+        for p in os.environ.get("PROBE_PATH", "").split(",")
+        if p.strip()
+    ]
+    model, sidecar = resolve_inference_model_and_config(raw_probe_paths)
+    _service = ProbeService(model, training_sidecar=sidecar)
     yield
     if _service is not None:
         _service.shutdown()
