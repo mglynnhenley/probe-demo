@@ -86,6 +86,82 @@ def test_extract_handles_batch_of_varying_lengths(extractor):
         assert tensors[1].shape[0] == len(ids_long)
 
 
+def test_train_py_end_to_end(tmp_path):
+    """train.py runs start-to-finish on a toy dataset and writes all expected artifacts."""
+    import json
+    import subprocess
+    import sys
+
+    jsonl = tmp_path / "annotations.jsonl"
+    rows = [
+        {
+            "question": "give an opinion",
+            "completion": "yes definitely it is",
+            "annotations": [{"span": "definitely", "index": 4, "label": 1}],
+        },
+        {
+            "question": "name a color",
+            "completion": "the sky is blue",
+            "annotations": [],
+        },
+        {
+            "question": "do it",
+            "completion": "no absolutely not",
+            "annotations": [{"span": "absolutely", "index": 3, "label": 1}],
+        },
+        {
+            "question": "describe weather",
+            "completion": "it is raining outside",
+            "annotations": [],
+        },
+    ]
+    jsonl.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    output_dir = tmp_path / "out"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""\
+model_name: {MODEL_ID}
+dtype: float32
+max_model_len: 256
+layer_idx: 10
+probe:
+  probe_model_type: mlp
+  hidden_size: 0
+  hidden_sizes: [16]
+  output_size: 1
+annotations_jsonl: {jsonl}
+val_fraction: 0.5
+pos_weight: auto
+epochs: 1
+train_batch_size: 2
+grad_accumulation_steps: 1
+probe_lr: 0.001
+warmup_steps: 0
+val_interval: 500
+log_interval: 1
+checkpoint_interval: 500
+output_dir: {output_dir}
+seed: 0
+"""
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    train_script = repo_root / "train" / "train.py"
+    result = subprocess.run(
+        [sys.executable, str(train_script), str(config_path)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    assert (output_dir / "probe_head.bin").exists()
+    assert (output_dir / "config.json").exists()
+    assert (output_dir / "training_metrics.json").exists()
+
+
 def test_probe_trainer_compute_loss_with_hf_extractor(extractor, tmp_path):
     """ProbeTrainer must accept an HFHiddenStateExtractor and produce a scalar loss."""
     from datasets import Dataset
