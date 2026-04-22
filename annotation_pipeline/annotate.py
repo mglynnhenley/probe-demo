@@ -698,12 +698,21 @@ def run(
     num_items: Optional[int] = None,
     use_batch: bool = False,
     batch_poll_interval: float = 60.0,
+    web_search: bool = False,
 ) -> int:
     """Annotate completions. Returns number of records written."""
     if use_batch and backend != "anthropic":
         raise ValueError("--batch is only supported with --backend anthropic.")
+    if web_search and backend != "openrouter":
+        raise ValueError("--web-search is only supported with --backend openrouter.")
 
     model = _resolve_model(backend, model)
+
+    if web_search and not model.endswith(":online"):
+        # OpenRouter routes `:online` models through Exa web search; results are injected
+        # into the prompt, so the model can verify URLs/DOIs/cases before labelling.
+        model = f"{model}:online"
+        print(f"Web search enabled — annotator model set to {model!r}")
 
     if backend == "openrouter":
         if not os.environ.get("OPENROUTER_API_KEY", "").strip():
@@ -913,6 +922,13 @@ def run(
     default=False,
     help="Cancel the in-progress batch in <output>.batch_state.json, then exit.",
 )
+@click.option(
+    "--web-search",
+    is_flag=True,
+    default=False,
+    help="Route annotator through OpenRouter's web-search plugin (appends ':online' to the model id). "
+    "Useful for policies that require verifying real-world facts (e.g. hallucinated citations).",
+)
 @click.option("--verbose", "-v", is_flag=True)
 def main(
     input_path: Optional[Path],
@@ -929,6 +945,7 @@ def main(
     use_batch: bool,
     batch_poll_interval: float,
     cancel_batch: bool,
+    web_search: bool,
     verbose: bool,
 ) -> None:
     logging.basicConfig(
@@ -974,6 +991,7 @@ def main(
         num_items=num_items,
         use_batch=use_batch,
         batch_poll_interval=batch_poll_interval,
+        web_search=web_search,
     )
 
 
