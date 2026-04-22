@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Hugging Face Trainer subclass: vLLM prefill hidden states → probe head.
+"""Hugging Face Trainer subclass: HF transformers prefill hidden states → probe head.
 
 Policy-violation labels are **severely imbalanced**: token ``1`` (violation) is rare; ``0``
 (non-violation) dominates. Training uses :class:`~torch.nn.BCEWithLogitsLoss` with
@@ -17,18 +17,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-import vllm
 from datasets import Dataset
 from torch.utils.data import RandomSampler, WeightedRandomSampler
 from transformers import Trainer, TrainingArguments
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import has_length
-from vllm.lora.request import LoRARequest
 
 from data import build_probe_feature_batches, prepare_probe_batch
+from hf_backend import HFHiddenStateExtractor
 from models import ValueHeadProbe
 from utils import save_training_metrics_json
-from vllm_probe_plugin import extract_prefill_hidden_states
 
 
 class StreamingLinearR2Reservoir:
@@ -115,7 +112,7 @@ class StreamingLinearR2Reservoir:
 
 
 class ProbeTrainer(Trainer):
-    """Train a probe on completion tokens using vLLM prefill hidden states.
+    """Train a probe on completion tokens using HF transformers prefill hidden states.
 
     After char→token mapping: ``1`` = violation (rare), ``0`` = non-violation (common),
     ``-100`` = ignore. Positive class in BCE is ``1``; use ``pos_weight`` when ``1`` is rare.
@@ -124,13 +121,11 @@ class ProbeTrainer(Trainer):
 
     def __init__(
         self,
-        vllm_llm: vllm.LLM,
-        tokenizer: PreTrainedTokenizerBase,
+        hf_extractor: HFHiddenStateExtractor,
         probe: ValueHeadProbe,
         train_dataset: Dataset,
         eval_dataset: Dataset,
         data_collator: Callable[..., Dict[str, Any]],
-        lora_request: LoRARequest | None,
         args: TrainingArguments,
         pos_weight: Optional[float] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
@@ -140,7 +135,7 @@ class ProbeTrainer(Trainer):
     ) -> None:
         super().__init__(
             model=probe.model,
-            processing_class=tokenizer,
+            processing_class=hf_extractor.tokenizer,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=data_collator,
@@ -148,10 +143,9 @@ class ProbeTrainer(Trainer):
             compute_metrics=self.compute_metrics,
             **kwargs,
         )
-        self.vllm_llm = vllm_llm
+        self.hf_extractor = hf_extractor
         self.probe = probe
         self.pos_weight = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight is not None else None
-        self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
         self.probe_training_metrics_interval_epochs = probe_training_metrics_interval_epochs
@@ -188,23 +182,11 @@ class ProbeTrainer(Trainer):
         return super().log(logs, start_time)
 
     def _move_model_to_device(self, model: nn.Module, device: torch.device) -> nn.Module:
-        # vLLM owns GPUs; probe stays on CPU (hidden states arrive as CPU tensors).
+        # HF extractor owns the base model device; probe stays on CPU (hidden states arrive as CPU tensors).
         return model
 
     def _get_hidden_states(self, token_id_lists: List[List[int]]) -> Dict[int, List[torch.Tensor]]:
-        sampling_params = vllm.SamplingParams(n=1, temperature=0.0, max_tokens=1)
-        outputs = self.vllm_llm.generate(
-            prompts=[{"prompt_token_ids": ids} for ids in token_id_lists],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-            lora_request=self.lora_request,
-        )
-        hidden_states_dict: Dict[int, List[torch.Tensor]] = {}
-        for output in outputs:
-            per_req = extract_prefill_hidden_states(output)
-            for layer_id, hs in per_req.items():
-                hidden_states_dict.setdefault(layer_id, []).append(hs)
-        return hidden_states_dict
+        return self.hf_extractor.extract(token_id_lists)
 
     def _stash_probe_metrics_batch(self, feature_batches: List[Any]) -> None:
         seq_batches = [
