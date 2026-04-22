@@ -6,7 +6,8 @@ states on CPU so they can feed the probe head unchanged.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -20,16 +21,17 @@ class HFHiddenStateExtractor:
         layers: List[int],
         dtype: torch.dtype = torch.float32,
         device: Optional[str] = None,
+        lora_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.model_name = model_name
         self.layers = list(layers)
         self.device = torch.device(device) if device is not None else _default_device()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            output_hidden_states=True,
-        )
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
+        if lora_path is not None:
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(self.model, str(lora_path))
         self.model.to(self.device).eval()
         self.hidden_size = int(self.model.config.hidden_size)
 
