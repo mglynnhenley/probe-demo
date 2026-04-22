@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Score a trained probe on annotated data and plot ROC from saved token logits.
 
+Uses HFHiddenStateExtractor (not vLLM) so this runs on Mac MPS, CPU, or CUDA
+with the same code path.
+
 Example:
-  uv run python scripts/evaluate_probe_roc.py configs/gemma4_31b_cluster.yaml
-  uv run python scripts/evaluate_probe_roc.py configs/gemma4_31b_cluster.yaml --split eval
+  .venv/bin/python scripts/evaluate_probe_roc.py configs/probe/qwen_small_mac.yaml
+  .venv/bin/python scripts/evaluate_probe_roc.py configs/probe/qwen_small_mac.yaml --split eval
 """
 
 from __future__ import annotations
@@ -17,9 +20,6 @@ from typing import Any, Dict, Iterable, List
 import click
 import numpy as np
 import torch
-import vllm
-import vllm_probe_plugin
-from vllm.lora.request import LoRARequest
 from tqdm.auto import tqdm
 
 from datasets import Dataset
@@ -32,41 +32,28 @@ for path in (ROOT, TRAIN_DIR):
         sys.path.insert(0, path_s)
 
 
-def load_training_config(path: Path) -> Any:
-    TrainingConfig = importlib.import_module("config").TrainingConfig
-    get_dtype = importlib.import_module("utils").get_dtype
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
 
-    cfg = TrainingConfig.from_yaml(path)
-    if cfg.dtype in (None, "auto"):
-        if torch.cuda.is_available():
-            cfg.dtype = get_dtype()
-        else:
-            cfg.dtype = None
-    return cfg
+
+def resolve_dtype(name: str | None) -> torch.dtype:
+    if name is None or name == "auto":
+        if torch.cuda.is_available() or torch.backends.mps.is_available():
+            return torch.bfloat16
+        return torch.float32
+    return _DTYPE_MAP[name]
 
 
 def iter_dataset_batches(dataset: Dataset, batch_size: int) -> Iterable[tuple[List[int], List[Dict[str, Any]]]]:
     for start in range(0, len(dataset), batch_size):
         indices = list(range(start, min(len(dataset), start + batch_size)))
         yield indices, [dataset[i] for i in indices]
-
-
-def get_hidden_states(llm: Any, token_id_lists: List[List[int]], lora_request: LoRARequest | None) -> Dict[int, List[torch.Tensor]]:
-    from vllm_probe_plugin import extract_prefill_hidden_states
-
-    sampling_params = vllm.SamplingParams(n=1, temperature=0.0, max_tokens=1)
-    outputs = llm.generate(
-        prompts=[{"prompt_token_ids": ids} for ids in token_id_lists],
-        sampling_params=sampling_params,
-        use_tqdm=False,
-        lora_request=lora_request,
-    )
-    hidden_states_dict: Dict[int, List[torch.Tensor]] = {}
-    for output in outputs:
-        per_req = extract_prefill_hidden_states(output)
-        for layer_id, hs in per_req.items():
-            hidden_states_dict.setdefault(layer_id, []).append(hs)
-    return hidden_states_dict
 
 
 def build_feature_batch_metadata(
@@ -183,13 +170,13 @@ def build_feature_batch_metadata(
 def score_dataset(
     dataset: Dataset,
     *,
-    llm: Any,
-    tokenizer: Any,
+    hf_extractor: Any,
     probe: Any,
     batch_size: int,
     chat_template_kwargs: Dict[str, Any],
-    lora_request: LoRARequest | None,
 ) -> dict[str, np.ndarray]:
+    from data import build_probe_feature_batches, collate_fn, prepare_probe_batch
+
     logits_all: List[torch.Tensor] = []
     labels_all: List[torch.Tensor] = []
     example_indices_all: List[torch.Tensor] = []
@@ -206,12 +193,10 @@ def score_dataset(
     )
 
     for batch_num, (batch_indices, rows) in enumerate(progress, start=1):
-        from data import build_probe_feature_batches, collate_fn, prepare_probe_batch
-
         collated = collate_fn(rows)
         annotations = collated["annotations_val"].float()
         prepared_batch = prepare_probe_batch(
-            tokenizer,
+            hf_extractor.tokenizer,
             collated["prompt"],
             collated["completion"],
             annotations,
@@ -224,19 +209,9 @@ def score_dataset(
             max_tok=max(prompt_token_lengths),
             scored_tok=n_scored_tokens,
         )
-        progress.set_description(
-            f"Scoring dataset ({batch_num}/{n_batches})"
-        )
-        try:
-            hidden_states_dict = get_hidden_states(llm, prepared_batch.token_id_lists, lora_request)
-        except Exception as exc:
-            print(
-                f"[score] batch {batch_num}/{n_batches}: failure during vLLM hidden-state generation "
-                f"(n_prompts={len(prompt_token_lengths)}, "
-                f"min_tokens={min(prompt_token_lengths)}, "
-                f"max_tokens={max(prompt_token_lengths)})"
-            )
-            raise RuntimeError("Failed during vLLM hidden-state generation") from exc
+        progress.set_description(f"Scoring dataset ({batch_num}/{n_batches})")
+
+        hidden_states_dict = hf_extractor.extract(prepared_batch.token_id_lists)
         hidden_states_list = hidden_states_dict[probe.layer_idx]
         feature_batches = build_probe_feature_batches(
             hidden_states_list,
@@ -261,15 +236,8 @@ def score_dataset(
                 bucket_shape=str(tuple(feature_batch.features.shape)),
                 scored_tok=n_scored_tokens,
             )
-            try:
-                with torch.no_grad():
-                    logits = probe.model(feature_batch.features).squeeze(-1).detach().to("cpu", dtype=torch.float32)
-            except Exception as exc:
-                print(
-                    f"[score] batch {batch_num}/{n_batches}: failure during probe scoring "
-                    f"for feature_shape={tuple(feature_batch.features.shape)}"
-                )
-                raise RuntimeError("Failed during probe scoring") from exc
+            with torch.no_grad():
+                logits = probe.model(feature_batch.features).squeeze(-1).detach().to("cpu", dtype=torch.float32)
             labels = feature_batch.labels.detach().to("cpu", dtype=torch.float32)
             local_example_indices = metadata_batch["example_indices"].detach().to("cpu", dtype=torch.int64)
             global_example_indices = torch.tensor(
@@ -339,11 +307,17 @@ def compute_roc(labels: np.ndarray, scores: np.ndarray) -> dict[str, np.ndarray 
 
 
 def write_summary(path: Path, payload: dict[str, Any]) -> None:
+    seq_auc = payload.get("auc_roc_sequence")
+    seq_auc_str = f"{seq_auc:.6f}" if seq_auc is not None else "undefined"
     lines = [
         f"n_scored_tokens={payload['n_scored_tokens']}",
         f"n_positive_tokens={payload['n_positive_tokens']}",
         f"n_negative_tokens={payload['n_negative_tokens']}",
-        f"auc_roc={payload['auc_roc']:.6f}",
+        f"n_sequences={payload['n_sequences']}",
+        f"n_sequences_violating={payload['n_sequences_violating']}",
+        f"n_sequences_clean={payload['n_sequences_clean']}",
+        f"auc_roc_token={payload['auc_roc_token']:.6f}",
+        f"auc_roc_sequence={seq_auc_str}",
         f"logit_min={payload['logit_min']:.6f}",
         f"logit_max={payload['logit_max']:.6f}",
         f"logit_mean={payload['logit_mean']:.6f}",
@@ -385,13 +359,20 @@ def plot_roc_curve(roc: dict[str, np.ndarray | float], out_path: Path, *, title:
     "--split",
     type=click.Choice(["all", "train", "eval"]),
     default="all",
-    help="Which dataset split to score.",
+    help="Which dataset split to score (ignored when --annotations-override is set).",
+)
+@click.option(
+    "--annotations-override",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to an alternative annotated jsonl (e.g. a held-out test set). "
+    "When set, ignores --split and scores every row in this file.",
 )
 @click.option(
     "--batch-size",
     type=int,
     default=None,
-    help="Examples per vLLM call (default: config train_batch_size).",
+    help="Examples per HF forward pass (default: config train_batch_size).",
 )
 @click.option(
     "--output-prefix",
@@ -403,6 +384,7 @@ def main(
     config_path: Path,
     probe_path: Path | None,
     split: str,
+    annotations_override: Path | None,
     batch_size: int | None,
     output_prefix: Path | None,
 ) -> None:
@@ -411,18 +393,14 @@ def main(
     utils_module = importlib.import_module("utils")
     build_annotations_dataset = data_module.build_annotations_dataset
     build_annotations_dataset_dict = data_module.build_annotations_dataset_dict
+    probe_prefill_token_count = utils_module.probe_prefill_token_count
     ProbeConfig = models_module.ProbeConfig
     ProbeModelConfig = models_module.ProbeModelConfig
     ValueHeadProbe = models_module.ValueHeadProbe
-    effective_probe_max_model_len = utils_module.effective_probe_max_model_len
-    get_compute_capability = utils_module.get_compute_capability
-    optimal_batch_size = utils_module.optimal_batch_size
-    probe_prefill_token_count = utils_module.probe_prefill_token_count
-    resolve_gpu_counts = utils_module.resolve_gpu_counts
-    from vllm_probe_plugin import configure_llm
-    from vllm_probe_plugin.utils import hidden_size_from_hf_config
+    TrainingConfig = importlib.import_module("config").TrainingConfig
+    HFHiddenStateExtractor = importlib.import_module("hf_backend").HFHiddenStateExtractor
 
-    cfg = load_training_config(config_path.expanduser().resolve())
+    cfg = TrainingConfig.from_yaml(config_path.expanduser().resolve())
     print(f"[setup] loaded config from {config_path.expanduser().resolve()}")
     probe_path = (
         probe_path.expanduser().resolve()
@@ -433,8 +411,14 @@ def main(
         raise SystemExit(f"Probe checkpoint not found: {probe_path}")
 
     dataset: Dataset
-    if split == "all":
+    if annotations_override is not None:
+        dataset = build_annotations_dataset(annotations_override.expanduser().resolve())
+        split = annotations_override.stem  # used for output naming
+        print(f"[setup] loaded held-out dataset from {annotations_override} "
+              f"with {len(dataset)} examples before truncation")
+    elif split == "all":
         dataset = build_annotations_dataset(Path(cfg.annotations_jsonl))
+        print(f"[setup] loaded dataset split={split} with {len(dataset)} examples before truncation")
     else:
         dataset_dict = build_annotations_dataset_dict(
             path=Path(cfg.annotations_jsonl),
@@ -442,40 +426,26 @@ def main(
             seed=cfg.seed,
         )
         dataset = dataset_dict[split]
-    print(f"[setup] loaded dataset split={split} with {len(dataset)} examples before truncation")
+        print(f"[setup] loaded dataset split={split} with {len(dataset)} examples before truncation")
 
-    vllm_probe_plugin.register()
-    print("[setup] registered vLLM probe plugin")
-    tp, dp = resolve_gpu_counts(cfg.tensor_parallel_size)
-    major_cc = get_compute_capability() if torch.cuda.is_available() else 0
-    if cfg.enable_chunked_prefill is not None:
-        chunked_prefill = cfg.enable_chunked_prefill
-    else:
-        chunked_prefill = major_cc >= 8
+    dtype = resolve_dtype(cfg.dtype)
+    print(f"[setup] dtype={dtype}")
 
-    print(
-        f"[setup] initializing vLLM "
-        f"(model={cfg.model_name}, tp={tp}, dp={dp}, max_model_len={cfg.max_model_len}, "
-        f"dtype={cfg.dtype}, chunked_prefill={chunked_prefill})"
-    )
-    llm = configure_llm(
-        model=cfg.model_name,
+    lora_path = cfg.lora_path if cfg.lora_present else None
+    hf_extractor = HFHiddenStateExtractor(
+        model_name=cfg.model_name,
         layers=[cfg.layer_idx],
-        dtype=cfg.dtype,
-        max_model_len=cfg.max_model_len,
-        tensor_parallel_size=tp,
-        data_parallel_size=dp,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-        trust_remote_code=cfg.trust_remote_code,
-        enable_chunked_prefill=chunked_prefill,
-        enable_lora=cfg.lora_present,
-        cudagraph_capture_sizes=[8, 16, 32, 64, 128],
+        dtype=dtype,
+        lora_path=lora_path,
     )
-    print("[setup] vLLM initialized successfully")
-    tokenizer = llm.get_tokenizer()
-    hf_config = llm.llm_engine.model_config.hf_config
-    effective_mml = effective_probe_max_model_len(llm, cfg.max_model_len)
-    print(f"[setup] effective max model len = {effective_mml}")
+    tokenizer = hf_extractor.tokenizer
+    print(
+        f"[setup] HF extractor ready "
+        f"(model={cfg.model_name}, layer={cfg.layer_idx}, hidden_size={hf_extractor.hidden_size}, "
+        f"device={hf_extractor.device})"
+    )
+
+    max_prefill_tokens = cfg.max_model_len - 1
 
     def within_limit(example: Dict[str, Any]) -> bool:
         n = probe_prefill_token_count(
@@ -484,23 +454,14 @@ def main(
             example["completion"],
             chat_template_kwargs=cfg.chat_template_kwargs,
         )
-        return n <= effective_mml - 1
+        return n <= max_prefill_tokens
 
     dataset = dataset.filter(within_limit)
     print(f"[setup] dataset size after length filter = {len(dataset)} examples")
 
-    if cfg.lora_present:
-        lora_request = LoRARequest(
-            lora_name="lora_probe",
-            lora_int_id=1,
-            lora_path=cfg.lora_path,
-        )
-    else:
-        lora_request = None
-
     probe_model_cfg = ProbeModelConfig(
         probe_model_type=cfg.probe.probe_model_type,
-        hidden_size=hidden_size_from_hf_config(hf_config),
+        hidden_size=hf_extractor.hidden_size,
         hidden_sizes=list(cfg.probe.hidden_sizes),
         output_size=cfg.probe.output_size,
         covseq=cfg.probe.covseq,
@@ -516,31 +477,40 @@ def main(
     )
     probe.model.eval()
     print(
-        f"[setup] probe loaded successfully "
+        f"[setup] probe loaded "
         f"(model_type={probe.cfg.model.model_type}, hidden_size={probe.cfg.model.hidden_size})"
     )
 
-    kv_max_batch = optimal_batch_size(llm, effective_mml)
-    requested_batch_size = batch_size or cfg.train_batch_size
-    if requested_batch_size > kv_max_batch:
-        print(
-            f"[batch_size] requested {requested_batch_size} exceeds vLLM KV budget "
-            f"({kv_max_batch} seqs at worst-case len={effective_mml}); capping."
-        )
-        batch_size = kv_max_batch
-    else:
-        batch_size = requested_batch_size
+    batch_size = batch_size or cfg.train_batch_size
     scored = score_dataset(
         dataset,
-        llm=llm,
-        tokenizer=tokenizer,
+        hf_extractor=hf_extractor,
         probe=probe,
         batch_size=batch_size,
         chat_template_kwargs=cfg.chat_template_kwargs,
-        lora_request=lora_request,
     )
 
     roc = compute_roc(scored["labels"], scored["logits"])
+
+    # Sequence-level: one score (max prob across scored tokens) and one label
+    # (any labelled token is positive) per example. Closer to the deployment
+    # use case — "flag this completion for review" rather than per-token.
+    ex_indices = scored["example_indices"]
+    unique_examples = np.unique(ex_indices)
+    seq_scores = np.zeros(len(unique_examples), dtype=np.float64)
+    seq_labels = np.zeros(len(unique_examples), dtype=np.uint8)
+    for i, ex in enumerate(unique_examples):
+        mask = ex_indices == ex
+        seq_scores[i] = float(scored["probs"][mask].max())
+        seq_labels[i] = int(scored["labels"][mask].any())
+    try:
+        seq_roc = compute_roc(seq_labels, seq_scores)
+        seq_auc: float | None = float(seq_roc["auc"])
+    except ValueError:
+        seq_roc = None
+        seq_auc = None
+        print("[warn] sequence-level AUC undefined — need both violating and clean examples")
+
     output_prefix = (
         output_prefix.expanduser().resolve()
         if output_prefix is not None
@@ -562,6 +532,11 @@ def main(
         roc_tpr=np.asarray(roc["tpr"]),
         roc_thresholds=np.asarray(roc["thresholds"]),
         roc_auc=np.asarray([roc["auc"]], dtype=np.float64),
+        seq_scores=seq_scores,
+        seq_labels=seq_labels,
+        seq_roc_auc=np.asarray(
+            [seq_auc if seq_auc is not None else np.nan], dtype=np.float64
+        ),
     )
 
     summary_payload = {
@@ -569,7 +544,11 @@ def main(
         "n_scored_tokens": int(len(scored["labels"])),
         "n_positive_tokens": int(scored["labels"].sum()),
         "n_negative_tokens": int(len(scored["labels"]) - scored["labels"].sum()),
-        "auc_roc": float(roc["auc"]),
+        "auc_roc_token": float(roc["auc"]),
+        "auc_roc_sequence": seq_auc,
+        "n_sequences": int(len(unique_examples)),
+        "n_sequences_violating": int(seq_labels.sum()),
+        "n_sequences_clean": int(len(seq_labels) - seq_labels.sum()),
         "logit_min": float(np.min(scored["logits"])),
         "logit_max": float(np.max(scored["logits"])),
         "logit_mean": float(np.mean(scored["logits"])),
@@ -580,14 +559,22 @@ def main(
     txt_path = output_prefix.with_suffix(".txt")
     write_summary(txt_path, summary_payload)
     png_path = output_prefix.with_suffix(".png")
+    title_parts = [f"Probe ROC ({split})", f"token AUC={float(roc['auc']):.4f}"]
+    if seq_auc is not None:
+        title_parts.append(f"seq AUC={seq_auc:.4f}")
     plot_roc_curve(
         roc,
         png_path,
-        title=f"Probe ROC ({split}) AUC={float(roc['auc']):.4f}",
+        title=" — ".join(title_parts),
     )
 
-    print(f"Scored split={split} with {summary_payload['n_scored_tokens']} labelled tokens")
-    print(f"ROC AUC: {summary_payload['auc_roc']:.6f}")
+    print(f"Scored split={split} with {summary_payload['n_scored_tokens']} labelled tokens "
+          f"across {summary_payload['n_sequences']} completions "
+          f"({summary_payload['n_sequences_violating']} violating / "
+          f"{summary_payload['n_sequences_clean']} clean)")
+    print(f"Token-level ROC AUC:    {summary_payload['auc_roc_token']:.6f}")
+    if seq_auc is not None:
+        print(f"Sequence-level ROC AUC: {seq_auc:.6f}")
     print(f"Wrote {npz_path}")
     print(f"Wrote {json_path}")
     print(f"Wrote {txt_path}")
