@@ -12,7 +12,7 @@ MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
 @pytest.fixture(scope="module")
 def extractor():
-    from train.hf_backend import HFHiddenStateExtractor
+    from hf_backend import HFHiddenStateExtractor
 
     return HFHiddenStateExtractor(
         model_name=MODEL_ID,
@@ -86,9 +86,80 @@ def test_extract_handles_batch_of_varying_lengths(extractor):
         assert tensors[1].shape[0] == len(ids_long)
 
 
+def test_probe_trainer_compute_loss_with_hf_extractor(extractor, tmp_path):
+    """ProbeTrainer must accept an HFHiddenStateExtractor and produce a scalar loss."""
+    from datasets import Dataset
+    from transformers import TrainingArguments
+
+    from data import collate_fn
+    from models import (
+        CovSeqConfig,
+        ProbeConfig,
+        ProbeModelConfig,
+        ValueHeadProbe,
+    )
+    from trainer import ProbeTrainer
+
+    rows = [
+        {"prompt": "name a color", "completion": "blue", "annotations_val": [0.0] * 4},
+        {
+            "prompt": "give an opinion",
+            "completion": "yes it is",
+            "annotations_val": [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    ]
+    ds = Dataset.from_list(rows)
+
+    probe_cfg = ProbeConfig(
+        layer_idx=10,
+        model=ProbeModelConfig(
+            probe_model_type="mlp",
+            hidden_size=extractor.hidden_size,
+            hidden_sizes=[16],
+            output_size=1,
+            covseq=CovSeqConfig(),
+        ),
+        underlying_model=MODEL_ID,
+    )
+    probe = ValueHeadProbe(probe_cfg)
+
+    args = TrainingArguments(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        use_cpu=True,
+        report_to=[],
+    )
+
+    trainer = ProbeTrainer(
+        hf_extractor=extractor,
+        probe=probe,
+        train_dataset=ds,
+        eval_dataset=ds,
+        data_collator=collate_fn,
+        args=args,
+    )
+
+    batch = collate_fn([ds[0], ds[1]])
+    loss = trainer.compute_loss(probe.model, batch)
+
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0
+    assert torch.isfinite(loss).item()
+
+
+def test_trainer_module_has_no_vllm_imports():
+    """Regression: trainer module must not import vllm or vllm_probe_plugin."""
+    import trainer as trainer_mod
+
+    src = Path(trainer_mod.__file__).read_text()
+    assert "import vllm" not in src
+    assert "vllm_probe_plugin" not in src
+    assert "LoRARequest" not in src
+
+
 def test_lora_adapter_changes_hidden_states(extractor, lora_dir):
     """Loading a PEFT adapter into HFHiddenStateExtractor must shift hidden states."""
-    from train.hf_backend import HFHiddenStateExtractor
+    from hf_backend import HFHiddenStateExtractor
 
     lora_extractor = HFHiddenStateExtractor(
         model_name=MODEL_ID,
