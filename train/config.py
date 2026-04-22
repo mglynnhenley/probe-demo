@@ -1,4 +1,4 @@
-"""YAML-driven training configuration for the policy-violation probe (vLLM + probe head)."""
+"""YAML-driven training configuration for the policy-violation probe (HF transformers backend)."""
 
 from __future__ import annotations
 
@@ -15,19 +15,13 @@ from models import ProbeModelConfig
 class TrainingConfig:
     """Training run settings. Loaded from YAML; see ``configs/default_config.yaml``."""
 
-    # ── Model / vLLM ─────────────────────────────────────────────────────
-    model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    # None or "auto": after load, set from compute capability (CUDA) via get_dtype(); else explicit string
+    # ── Model ────────────────────────────────────────────────────────────
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    # Torch dtype string (``float32``, ``bfloat16``, ``float16``); ``None``/``auto`` ⇒ bfloat16 on CUDA/MPS, float32 on CPU.
     dtype: Optional[str] = None
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.75
-    # None: enable chunked prefill only on Ampere+ (cc>=8); false saves VRAM on V100/Pascal.
-    enable_chunked_prefill: Optional[bool] = None
-    # Tensor parallel width required for this model; combined with available GPUs → (tp, dp)
-    tensor_parallel_size: int = 1
-    layer_idx: int = 30  # hidden state layer extracted by vLLM (valid range depends on model depth)
-    trust_remote_code: bool = True
-    # Passed to tokenizer/processor apply_chat_template (e.g. Gemma 4: enable_thinking: false)
+    layer_idx: int = 10  # hidden state layer extracted from the HF model (valid range depends on depth)
+    # Passed to tokenizer/processor apply_chat_template (e.g. enable_thinking for Qwen 3)
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
     lora_present: bool = False
     lora_path: str = "output/lora_adapter/"
@@ -50,7 +44,7 @@ class TrainingConfig:
 
     # ── Training ─────────────────────────────────────────────────────────
     epochs: int = 3
-    # Sequences per vLLM prefill call (capped to KV budget in train.py; default >1 for throughput)
+    # Sequences per HF forward pass through the base model
     train_batch_size: int = 8
     grad_accumulation_steps: int = 1
     probe_lr: float = 1e-3

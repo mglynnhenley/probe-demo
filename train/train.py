@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Train the policy-violation probe via Hugging Face Trainer + vLLM prefill hidden states.
+Train the policy-violation probe via Hugging Face Trainer + HF transformers prefill hidden states.
 
 Labels are **highly imbalanced**: ``1`` only on annotated violation spans (rare), ``0`` on
 almost all completion characters. With ``pos_weight: auto``, BCE uses the **effective**
@@ -14,10 +14,8 @@ from pathlib import Path
 
 import click
 import torch
-import vllm_probe_plugin
 from transformers import TrainingArguments
 from transformers.trainer_callback import PrinterCallback, ProgressCallback
-from vllm.lora.request import LoRARequest
 
 from config import TrainingConfig
 from data import (
@@ -29,33 +27,35 @@ from data import (
     train_sampler_weights_and_effective_pos_weight,
     truncate_dataset,
 )
+from hf_backend import HFHiddenStateExtractor
 from models import ProbeConfig, ProbeModelConfig, ValueHeadProbe
 from trainer import ProbeTrainer
 from utils import (
-    effective_probe_max_model_len,
-    get_compute_capability,
-    get_dtype,
-    optimal_batch_size,
-    resolve_gpu_counts,
     save_training_config_json,
     save_training_metrics_json,
 )
-from vllm_probe_plugin import configure_llm
-from vllm_probe_plugin.utils import hidden_size_from_hf_config
 
 
-def load_training_config(path: Path) -> TrainingConfig:
-    """Load YAML and resolve ``dtype`` when unset or ``auto`` (compute-capability based on CUDA)."""
-    cfg = TrainingConfig.from_yaml(path)
-    if cfg.dtype in (None, "auto"):
-        if torch.cuda.is_available():
-            cfg.dtype = get_dtype()
-            print(f"[dtype] {cfg.dtype!r} (from GPU compute capability)")
-        else:
-            print("[dtype] None — no CUDA; vLLM will use its default resolution")
-    else:
-        print(f"[dtype] {cfg.dtype!r} (from config)")
-    return cfg
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
+
+
+def resolve_dtype(name: str | None) -> torch.dtype:
+    """Map a config dtype string to a torch.dtype; default to bfloat16 on GPU/MPS, float32 on CPU."""
+    if name is None or name == "auto":
+        if torch.cuda.is_available() or torch.backends.mps.is_available():
+            return torch.bfloat16
+        return torch.float32
+    try:
+        return _DTYPE_MAP[name]
+    except KeyError as e:
+        raise ValueError(f"Unknown dtype {name!r}; valid: {sorted(_DTYPE_MAP)}") from e
 
 
 class TqdmMetricsCallback(ProgressCallback):
@@ -113,7 +113,7 @@ class TqdmMetricsCallback(ProgressCallback):
 @click.command(context_settings=dict(help_option_names=["-h", "--help"], show_default=True))
 @click.argument("config_path", type=click.Path(exists=True, path_type=Path))
 def main(config_path: Path) -> None:
-    cfg = load_training_config(config_path)
+    cfg = TrainingConfig.from_yaml(config_path)
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
     annotations_dataset_dict = build_annotations_dataset_dict(
@@ -123,58 +123,24 @@ def main(config_path: Path) -> None:
     )
     print(f"Loaded annotations from {cfg.annotations_jsonl}")
 
-    vllm_probe_plugin.register()
+    dtype = resolve_dtype(cfg.dtype)
+    print(f"[dtype] {dtype}")
 
-    tp, dp = resolve_gpu_counts(cfg.tensor_parallel_size)
-    major_cc = get_compute_capability() if torch.cuda.is_available() else 0
-    if cfg.enable_chunked_prefill is not None:
-        chunked_prefill = cfg.enable_chunked_prefill
-    else:
-        # Match vLLM-style defaults: chunked prefill helps long contexts on Ampere+ but
-        # adds allocator pressure on older GPUs (e.g. 4×V100 + 31B is tight).
-        chunked_prefill = major_cc >= 8
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(
-        f"Loading vLLM: tensor_parallel_size={tp}, data_parallel_size={dp} "
-        f"(requested TP={cfg.tensor_parallel_size}, GPUs={n_gpus}, CC major={major_cc}, "
-        f"chunked_prefill={chunked_prefill})"
-    )
-
-    llm = configure_llm(
-        model=cfg.model_name,
-        layers=[cfg.layer_idx],
-        dtype=cfg.dtype,
-        max_model_len=cfg.max_model_len,
-        tensor_parallel_size=tp,
-        data_parallel_size=dp,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-        trust_remote_code=cfg.trust_remote_code,
-        enable_chunked_prefill=chunked_prefill,
-        enable_lora=cfg.lora_present,
-        # enforce_eager = True, # disabling these optimisations is expensive
-        cudagraph_capture_sizes=[8, 16, 32, 64, 128], # speed up startup time by restricting graphs
-    )
-
+    lora_path = cfg.lora_path if cfg.lora_present else None
     if cfg.lora_present:
         print(f"LoRA enabled (adapter path): {cfg.lora_path}")
-        lora_request = LoRARequest(
-            lora_name="lora_probe",
-            lora_int_id=1,
-            lora_path=cfg.lora_path,
-        )
     else:
         print("No LoRA adapter — continuing without LoRA")
-        lora_request = None
 
-    hf_config = llm.llm_engine.model_config.hf_config
-    effective_mml = effective_probe_max_model_len(llm, cfg.max_model_len)
-    if effective_mml != cfg.max_model_len:
-        print(
-            f"[max_model_len] vLLM effective limit is {effective_mml} "
-            f"(config requested {cfg.max_model_len}); dataset truncation uses {effective_mml}"
-        )
+    hf_extractor = HFHiddenStateExtractor(
+        model_name=cfg.model_name,
+        layers=[cfg.layer_idx],
+        dtype=dtype,
+        lora_path=lora_path,
+    )
+    tokenizer = hf_extractor.tokenizer
+    resolved_hidden_size = hf_extractor.hidden_size
 
-    resolved_hidden_size = hidden_size_from_hf_config(hf_config)
     probe_model_cfg = ProbeModelConfig(
         probe_model_type=cfg.probe.probe_model_type,
         hidden_size=resolved_hidden_size,
@@ -200,28 +166,6 @@ def main(config_path: Path) -> None:
         f"compressed_size={probe.cfg.model.covseq.compressed_size}"
     )
 
-    kv_max_batch = optimal_batch_size(llm, effective_mml)
-    requested = cfg.train_batch_size
-    if requested > kv_max_batch:
-        print(
-            f"[batch_size] requested {requested} exceeds vLLM KV budget ({kv_max_batch} seqs at "
-            f"worst-case len={effective_mml}); capping. To raise the cap: increase "
-            f"gpu_memory_utilization, use a shorter max_model_len, a smaller model, or more GPU memory."
-        )
-        cfg.train_batch_size = kv_max_batch
-    elif requested < kv_max_batch:
-        print(
-            f"[batch_size] using {cfg.train_batch_size} sequences per vLLM call "
-            f"(KV budget allows up to {kv_max_batch} at len≤{effective_mml}; increase train_batch_size in YAML to use more)"
-        )
-    else:
-        print(
-            f"[batch_size] using {cfg.train_batch_size} sequences per vLLM call "
-            f"(at KV budget limit {kv_max_batch})"
-        )
-
-    tokenizer = llm.get_tokenizer()
-
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.train_batch_size,
@@ -233,7 +177,7 @@ def main(config_path: Path) -> None:
         eval_steps=cfg.val_interval,
         per_device_eval_batch_size=cfg.train_batch_size,
         save_steps=cfg.checkpoint_interval,
-        # Probe runs on CPU; vLLM owns GPUs (transformers v5: `no_cuda` removed → `use_cpu`).
+        # Probe runs on CPU; hf_extractor owns the base-model device.
         use_cpu=True,
         optim="adamw_torch",
         weight_decay=0.01,
@@ -244,12 +188,13 @@ def main(config_path: Path) -> None:
         max_grad_norm=cfg.max_grad_norm,
         remove_unused_columns=False,
         seed=cfg.seed,
+        report_to=[],
     )
 
     annotations_dataset_dict = truncate_dataset(
         annotations_dataset_dict,
         tokenizer,
-        effective_mml,
+        cfg.max_model_len,
         chat_template_kwargs=cfg.chat_template_kwargs,
     )
     train_dataset = annotations_dataset_dict["train"]
@@ -344,14 +289,12 @@ def main(config_path: Path) -> None:
             )
 
     trainer = ProbeTrainer(
-        vllm_llm=llm,
-        tokenizer=tokenizer,
+        hf_extractor=hf_extractor,
         probe=probe,
         pos_weight=pos_weight,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collate_fn,
-        lora_request=lora_request,
         args=training_args,
         chat_template_kwargs=cfg.chat_template_kwargs,
         train_sampler_weights=sampler_weights,

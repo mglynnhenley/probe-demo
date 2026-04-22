@@ -93,16 +93,14 @@ def test_train_py_end_to_end(tmp_path):
     import sys
 
     jsonl = tmp_path / "annotations.jsonl"
+    # Every row carries at least one violation span so a 50/50 split cannot
+    # empty either partition of positives (data.py raises if the weighted
+    # positive token mass is zero in the train split).
     rows = [
         {
             "question": "give an opinion",
             "completion": "yes definitely it is",
             "annotations": [{"span": "definitely", "index": 4, "label": 1}],
-        },
-        {
-            "question": "name a color",
-            "completion": "the sky is blue",
-            "annotations": [],
         },
         {
             "question": "do it",
@@ -111,8 +109,13 @@ def test_train_py_end_to_end(tmp_path):
         },
         {
             "question": "describe weather",
-            "completion": "it is raining outside",
-            "annotations": [],
+            "completion": "it is raining heavily outside",
+            "annotations": [{"span": "heavily", "index": 14, "label": 1}],
+        },
+        {
+            "question": "name a color",
+            "completion": "the sky is very blue",
+            "annotations": [{"span": "very", "index": 11, "label": 1}],
         },
     ]
     jsonl.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
