@@ -6,14 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
-    "vllm-probe-plugin",
-    # Align with Gemma 4 + vLLM 0.19+ inference stacks (transformers v5 tokenizer / chat templates).
     "accelerate>=1.13.0",
     "click>=8.0",
     "pyyaml>=6.0",
     "datasets>=3.0",
     "httpx>=0.27",
     "openai>=1.0.0",
+    "peft>=0.12",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "rapidfuzz>=3.0",
@@ -24,18 +23,12 @@ dependencies = [
     "numpy>=1.26",
     "matplotlib>=3.10.8",
     "trl>=0.17",
-    "unsloth>=2025.4",
-    "deepspeed>=0.18.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-
-[tool.uv.sources]
-vllm-probe-plugin = { path = "../../vllm-probe-plugin", editable = true }
-
-[tool.uv]
-# Keep transformers on v5.x so the resolver does not downgrade below Gemma 4 requirements.
-override-dependencies = [
-    "transformers>=5.5.0",
-]
