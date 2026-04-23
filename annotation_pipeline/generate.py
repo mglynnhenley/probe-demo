@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from openai import AsyncOpenAI, OpenAI
@@ -316,8 +317,12 @@ async def _async_categorise_policy(
             {"role": "user", "content": f"Policy: {policy}"},
         ],
     )
-    text = _strip_code_fences(response.choices[0].message.content)
-    categories = json.loads(text)
+    raw = response.choices[0].message.content
+    try:
+        categories = json.loads(_extract_json_object(raw))
+    except (ValueError, json.JSONDecodeError) as e:
+        log.warning("Categorisation JSON parse failed (%s); falling back to single bucket", e)
+        categories = {"general": total}
 
     # Normalise counts to sum to exactly `total`
     raw_total = sum(categories.values())
@@ -454,3 +459,39 @@ def _strip_code_fences(text: str) -> str:
         lines = text.splitlines()
         text = "\n".join(lines[1:-1])
     return text
+
+
+def _extract_json_object(text: str) -> str:
+    """Return the first balanced {...} or [...] block from text.
+
+    Tolerates trailing prose / multiple JSON objects / minor formatting drift
+    that json.loads would reject. Raises ValueError if no balanced block found.
+    """
+    stripped = _strip_code_fences(text)
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_ch)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(stripped)):
+            c = stripped[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\" and in_str:
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return stripped[start : i + 1]
+    raise ValueError(f"No balanced JSON object found in text: {text[:200]!r}")
