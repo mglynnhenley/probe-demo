@@ -1,0 +1,43 @@
+# Mac-shaped training config: Qwen2.5-0.5B-Instruct via HF transformers on MPS.
+# MLP probe head, layer 10. Pilot config (100-row training set).
+
+model_name: Qwen/Qwen2.5-0.5B-Instruct
+dtype: auto
+max_model_len: 2048
+layer_idx: 10
+lora_present: false
+
+probe:
+  probe_model_type: mlp
+  hidden_size: 0
+  hidden_sizes: [256]
+  output_size: 1
+  covseq:
+    window_size: 8
+    compressed_size: 64
+    training_metrics_interval_epochs: 1.0
+
+annotations_jsonl: data/structuring_annotated.jsonl
+
+val_fraction: 0.2
+
+pos_weight: auto
+pos_weight_max: null
+
+sampler_row_weight_min: 1.0
+sampler_row_weight_max: 10.0
+
+epochs: 5
+train_batch_size: 8
+grad_accumulation_steps: 1
+probe_lr: 1.0e-3
+warmup_steps: 10
+max_grad_norm: 1.0
+
+val_interval: 50
+log_interval: 5
+checkpoint_interval: 500
+
+output_dir: output/qwen_mac_structuring
+
+seed: 42
