@@ -1,0 +1,322 @@
+openapi: 3.1.0
+info:
+  title: Probe-Demo Inference API
+  version: 0.1.0
+  summary: OpenAI-compatible chat completions with per-token probe scores.
+  description: |
+    Wraps a locally-served Qwen model with one or more classifier probes
+    that emit a score per generated token. The REST surface is
+    deliberately OpenAI-compatible so the `openai` Python / JS / Go SDK
+    clients work out of the box — every extension lives in additive
+    fields that standard SDKs expose as model_extras.
+
+    **Extensions vs. stock OpenAI:**
+      - `POST /v1/chat/completions` accepts two extra request fields:
+        `include_scores` and `probe_path`.
+      - Non-streaming responses add a `scores` field:
+        `{ "<probe_name>": [float per generated token] }`.
+      - Streaming (SSE) chunks add a `scores` field:
+        `{ "<probe_name>": float }` for the single token in the chunk.
+        `scores` is null on the opening role chunk and the final
+        `finish_reason` chunk.
+
+    **Authentication:** none. Intended for loopback / LAN use. Stock
+    OpenAI clients that require an API key can send any string — it is
+    ignored.
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev server (default HOST / PORT env vars).
+
+tags:
+  - name: health
+  - name: models
+  - name: chat
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe.
+      operationId: health
+      responses:
+        "200":
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                required: [status]
+
+  /v1/models:
+    get:
+      tags: [models]
+      summary: List loaded models.
+      description: |
+        Returns a single-entry list — this server hosts exactly one
+        base model at a time (set via `MODEL_NAME` env var).
+      operationId: listModels
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+
+  /v1/models/{model_id}:
+    get:
+      tags: [models]
+      summary: Retrieve a single model card.
+      operationId: retrieveModel
+      parameters:
+        - name: model_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Must match the loaded model's id; otherwise 404.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelCard" }
+        "404":
+          description: Model id does not match the loaded model.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HttpError" }
+
+  /v1/chat/completions:
+    post:
+      tags: [chat]
+      summary: Create a chat completion (with optional probe scores).
+      description: |
+        When `stream=false` (default), returns one `ChatCompletion`
+        with a `scores` map of `probe_name → [float]` aligned to the
+        generated tokens (length == `usage.completion_tokens`).
+
+        When `stream=true`, returns Server-Sent Events where each
+        `data:` line is a `ChatCompletionChunk` JSON. Clients should
+        stop when they see `data: [DONE]`.
+
+        `include_scores=false` disables probe inference entirely and
+        returns a pure OpenAI-shape response (no `scores`).
+      operationId: createChatCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatCompletionRequest" }
+      responses:
+        "200":
+          description: |
+            On `stream=false`: a single JSON `ChatCompletion`.
+            On `stream=true`: SSE stream of `ChatCompletionChunk` events
+            terminated by `data: [DONE]`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatCompletion" }
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Newline-delimited SSE. Each event body is a
+                  `ChatCompletionChunk` JSON; the terminal event is
+                  the literal string `[DONE]`.
+        "422":
+          description: Request validation error (e.g. missing `messages`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HttpError" }
+
+components:
+  schemas:
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content: { type: string }
+
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: |
+            Ignored on the server (it always uses the single loaded
+            model) but required for OpenAI SDK compatibility. Pass
+            the value returned by `GET /v1/models`.
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/ChatMessage" }
+          minItems: 1
+        stream:
+          type: boolean
+          default: false
+        max_tokens:
+          type: integer
+          nullable: true
+          minimum: 1
+        temperature:
+          type: number
+          default: 0.7
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          default: 0.9
+          minimum: 0
+          maximum: 1
+        include_scores:
+          type: boolean
+          default: true
+          description: |
+            Extension. When false, skips probe inference and omits the
+            `scores` field from the response. Useful when only the
+            completion is needed.
+        probe_path:
+          type: string
+          nullable: true
+          description: |
+            Extension. Absolute path to a `probe_head.bin` checkpoint
+            on the server's filesystem. If omitted, the server uses
+            the `PROBE_PATH` env var's value(s). Unknown / unreadable
+            paths cause a 422.
+
+    CompletionUsage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+
+    ChatCompletionMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [assistant]
+        content: { type: string }
+
+    ChatCompletionChoice:
+      type: object
+      required: [index, message]
+      properties:
+        index: { type: integer, default: 0 }
+        message: { $ref: "#/components/schemas/ChatCompletionMessage" }
+        finish_reason:
+          type: string
+          enum: [stop, length]
+          nullable: true
+          default: stop
+
+    ChatCompletion:
+      type: object
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id: { type: string, example: "chatcmpl-abc123def456" }
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          description: Unix seconds.
+        model: { type: string }
+        choices:
+          type: array
+          items: { $ref: "#/components/schemas/ChatCompletionChoice" }
+        usage: { $ref: "#/components/schemas/CompletionUsage" }
+        scores:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: array
+            items: { type: number }
+          description: |
+            Extension. One entry per active probe. Each array has
+            length `usage.completion_tokens` — element `i` is the
+            probe's raw score for the `i`-th generated token. `null`
+            when `include_scores=false` or no probes are loaded.
+
+    DeltaMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [assistant]
+          nullable: true
+        content:
+          type: string
+          nullable: true
+
+    ChatCompletionChunkChoice:
+      type: object
+      required: [index, delta]
+      properties:
+        index: { type: integer, default: 0 }
+        delta: { $ref: "#/components/schemas/DeltaMessage" }
+        finish_reason:
+          type: string
+          enum: [stop, length]
+          nullable: true
+
+    ChatCompletionChunk:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id: { type: string }
+        object:
+          type: string
+          enum: [chat.completion.chunk]
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items: { $ref: "#/components/schemas/ChatCompletionChunkChoice" }
+        scores:
+          type: object
+          nullable: true
+          additionalProperties: { type: number }
+          description: |
+            Extension. One float per active probe for the single token
+            emitted in this chunk. `null` on the opening role chunk
+            and the terminal `finish_reason` chunk.
+
+    ModelCard:
+      type: object
+      required: [id, object, created, owned_by]
+      properties:
+        id: { type: string }
+        object:
+          type: string
+          enum: [model]
+        created: { type: integer }
+        owned_by: { type: string, default: organization }
+
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/ModelCard" }
+
+    HttpError:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string }
