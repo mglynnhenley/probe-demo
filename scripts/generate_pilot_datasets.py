@@ -29,6 +29,16 @@ NUM_GENERATIONS = 100
 POLICIES = [
     ("hallucinated_citations", REPO_ROOT / "policies" / "hallucinated_citations.txt"),
     ("tipping_off", REPO_ROOT / "policies" / "tipping_off.txt"),
+    ("religious_truth_claim", REPO_ROOT / "policies" / "religious_truth_claim.txt"),
+    ("partisan_endorsement", REPO_ROOT / "policies" / "partisan_endorsement.txt"),
+    ("definitive_diagnosis", REPO_ROOT / "policies" / "definitive_diagnosis.txt"),
+    ("personal_investment_rec", REPO_ROOT / "policies" / "personal_investment_rec.txt"),
+    ("moralising", REPO_ROOT / "policies" / "moralising.txt"),
+    ("sycophancy", REPO_ROOT / "policies" / "sycophancy.txt"),
+    ("unsolicited_disclaimer", REPO_ROOT / "policies" / "unsolicited_disclaimer.txt"),
+    ("fabricated_quote", REPO_ROOT / "policies" / "fabricated_quote.txt"),
+    ("structuring", REPO_ROOT / "policies" / "structuring.txt"),
+    ("guaranteed_returns", REPO_ROOT / "policies" / "guaranteed_returns.txt"),
 ]
 
 
@@ -38,6 +48,11 @@ def _policy_sentence(policy_path: Path) -> str:
 
 
 async def _run_one(name: str, policy_path: Path) -> Path:
+    out = REPO_ROOT / "data" / f"{name}_generations.jsonl"
+    if out.exists() and out.stat().st_size > 0:
+        n_rows = sum(1 for line in out.read_text(encoding="utf-8").splitlines() if line.strip())
+        print(f"[{name}] SKIP: {out} already has {n_rows} rows")
+        return out
     policy = _policy_sentence(policy_path)
     print(f"[{name}] policy: {policy[:100]}…")
     jsonl = await _async_generate_dataset(
@@ -46,7 +61,6 @@ async def _run_one(name: str, policy_path: Path) -> Path:
         prompt_model=PROMPT_MODEL,
         completion_model=COMPLETION_MODEL,
     )
-    out = REPO_ROOT / "data" / f"{name}_generations.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(jsonl, encoding="utf-8")
     n_rows = sum(1 for line in jsonl.splitlines() if line.strip())
@@ -55,12 +69,14 @@ async def _run_one(name: str, policy_path: Path) -> Path:
 
 
 async def _main() -> None:
-    results = await asyncio.gather(
-        *(_run_one(name, path) for name, path in POLICIES)
-    )
+    tasks = [_run_one(name, path) for name, path in POLICIES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     print("Done:")
-    for p in results:
-        print(f"  {p}")
+    for (name, _), r in zip(POLICIES, results):
+        if isinstance(r, Exception):
+            print(f"  [FAIL] {name}: {type(r).__name__}: {r}")
+        else:
+            print(f"  [OK]   {r}")
 
 
 if __name__ == "__main__":
