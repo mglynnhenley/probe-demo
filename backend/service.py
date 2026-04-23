@@ -1,22 +1,18 @@
-"""Inference service: vLLM AsyncLLM + probe scoring."""
+"""Inference service: HF transformers + probe scoring."""
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 import json
 import os
-import queue as _queue
 import sys
 import threading
-import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 import torch
-import uvloop
 
 # Probe model classes live in the sibling train package.
 _TRAIN_DIR = Path(__file__).resolve().parent.parent / "train"
@@ -25,20 +21,46 @@ if str(_TRAIN_DIR) not in sys.path:
 
 from models import CovSeqModel, ValueHeadProbe, ProbeConfig  # noqa: E402  (train package)
 
-_DONE = object()
 
 _KNOWN_ENV_VARS = {
     "MODEL_NAME",
     "PROBE_PATH",
-    "VLLM_DTYPE",
-    "VLLM_MAX_MODEL_LEN",
-    "VLLM_GPU_MEMORY_UTILIZATION",
-    "VLLM_TENSOR_PARALLEL_SIZE",
-    "VLLM_TRUST_REMOTE_CODE",
+    "HF_DTYPE",
+    "HF_DEVICE",
     "HF_TOKEN",
+    "HF_TRUST_REMOTE_CODE",
+    "MAX_MODEL_LEN",
     "HOST",
     "PORT",
 }
+
+
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
+
+
+def _resolve_dtype(name: Optional[str]) -> torch.dtype:
+    if not name or str(name).lower() == "auto":
+        if torch.cuda.is_available() or torch.backends.mps.is_available():
+            return torch.bfloat16
+        return torch.float32
+    if name not in _DTYPE_MAP:
+        raise ValueError(f"Unknown dtype {name!r}; expected one of {sorted(_DTYPE_MAP) + ['auto']}")
+    return _DTYPE_MAP[name]
+
+
+def _default_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def _warn_suspicious_env_vars() -> None:
@@ -55,7 +77,7 @@ def _warn_suspicious_env_vars() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Resolve base model + training sidecar (TP, max_len, chat template kwargs)
+# Resolve base model + training sidecar (chat template kwargs, dtype, etc.)
 # ---------------------------------------------------------------------------
 
 def _expand_probe_checkpoint(raw: str) -> Path:
@@ -81,8 +103,9 @@ def _read_training_sidecar_next_to_probe(probe_file: Path) -> dict[str, Any]:
 def resolve_inference_model_and_config(raw_probe_paths: list[str]) -> tuple[str, dict[str, Any]]:
     """Infer the Hugging Face model id from env, probe checkpoints, or training ``config.json``.
 
-    Training saves :class:`~models.ProbeConfig` with ``underlying_model`` set to the vLLM base model.
-    The run directory also contains ``config.json`` with ``model_name``, ``tensor_parallel_size``, etc.
+    Training saves :class:`~models.ProbeConfig` with ``underlying_model`` set to the HF base model.
+    The run directory also contains ``config.json`` (asdict of TrainingConfig) with ``model_name``,
+    ``chat_template_kwargs``, ``dtype``, etc.
     """
     env_model = (os.environ.get("MODEL_NAME") or "").strip()
     inferred: str | None = None
@@ -125,7 +148,7 @@ def resolve_inference_model_and_config(raw_probe_paths: list[str]) -> tuple[str,
     if not model:
         raise RuntimeError(
             "Could not determine which Hugging Face model to load.\n"
-            "  • export MODEL_NAME=google/gemma-4-31B-it\n"
+            "  • export MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct\n"
             "  • or export PROBE_PATH to your probe checkpoint:\n"
             "      export PROBE_PATH=/path/to/output/run/probe_head.bin\n"
             "    or the training output directory containing probe_head.bin + config.json\n"
@@ -133,7 +156,7 @@ def resolve_inference_model_and_config(raw_probe_paths: list[str]) -> tuple[str,
             "or sit next to config.json with \"model_name\"."
         )
 
-    print(f"[INIT] HF model for vLLM: {model}", flush=True)
+    print(f"[INIT] HF model: {model}", flush=True)
     if env_model:
         print("[INIT] (MODEL_NAME env overrides inferred id)", flush=True)
     return model, sidecar
@@ -204,27 +227,59 @@ def run_probe_step(
 
 
 # ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+
+def _sample_token(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+) -> int:
+    """Sample one token id from a 1-D logits tensor.
+
+    Greedy when ``temperature <= 0``; otherwise applies temperature and
+    nucleus (top-p) filtering before multinomial sampling.
+    """
+    if temperature <= 0:
+        return int(torch.argmax(logits).item())
+
+    logits = logits.float() / temperature
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        # Mask sorted positions whose cumulative probability has already crossed
+        # top_p, but keep the first crossing token so at least one nonzero prob remains.
+        remove_sorted = cumulative > top_p
+        remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
+        remove_sorted[..., 0] = False
+        remove = torch.zeros_like(remove_sorted)
+        remove.scatter_(0, sorted_idx, remove_sorted)
+        logits = logits.masked_fill(remove, float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+# ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 
 class ProbeService:
-    """Owns the vLLM AsyncLLM engine and a cache of loaded probes."""
+    """Owns the HF transformers model and a cache of loaded probes."""
 
     def __init__(self, model_name: str, training_sidecar: dict[str, Any] | None = None) -> None:
-        import vllm
-        import vllm_probe_plugin
-        from vllm_probe_plugin import _result_bus
-        from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.v1.engine.async_llm import AsyncLLM
-        from transformers import AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tc = training_sidecar or {}
         self._chat_template_kwargs: dict[str, Any] = dict(tc.get("chat_template_kwargs") or {})
 
         self.model_name = model_name
-        self.tokenizer = None
         self._probe_cache: dict[str, ValueHeadProbe] = {}  # path → probe
         self._shutting_down = False
+        # HF model forward isn't safe to invoke from multiple threads concurrently
+        # (shared past_key_values, internal buffers). Serialize generation requests.
+        self._gen_lock = threading.Lock()
 
         # Pre-load probe(s) configured via env so layer IDs are known at startup.
         startup_probe_paths = [
@@ -236,70 +291,56 @@ class ProbeService:
             self._load_probe(p)
 
         probe_layer_ids = sorted({pr.cfg.layer_idx for pr in self._probe_cache.values()})
-        if not probe_layer_ids:
-            # No probes configured; capture nothing — plain generation still works.
-            probe_layer_ids = []
-
         print(f"[INIT] Probe layer IDs: {probe_layer_ids}", flush=True)
 
-        # Plugin env vars must be set before engine start.
-        if probe_layer_ids:
-            os.environ["VLLM_PROBE_LAYER_IDS"] = ",".join(str(i) for i in probe_layer_ids)
-            os.environ["VLLM_PROBE_INCLUDE_PREFILL"] = "1"
-        os.environ.setdefault("VLLM_RINGBUFFER_WARNING_INTERVAL", "180")
-        os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+        dtype_name = os.environ.get("HF_DTYPE") or tc.get("dtype")
+        dtype = _resolve_dtype(dtype_name)
+        device_name = os.environ.get("HF_DEVICE")
+        self._device = torch.device(device_name) if device_name else _default_device()
+        self._max_model_len = int(float(
+            os.environ.get("MAX_MODEL_LEN", tc.get("max_model_len", 32768))
+        ))
+        trust_remote_code_env = os.environ.get("HF_TRUST_REMOTE_CODE")
+        if trust_remote_code_env is not None:
+            trust_remote_code = trust_remote_code_env.strip().lower() in ("1", "true", "yes")
+        else:
+            trust_remote_code = bool(tc.get("trust_remote_code", True))
 
-        torch._dynamo.config.suppress_errors = True
-        vllm_probe_plugin.register()
-        _result_bus.start()
-
-        self._loop = uvloop.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._loop.run_forever, daemon=True, name="asyncllm-loop"
-        )
-        self._loop_thread.start()
-
-        dtype = os.environ.get("VLLM_DTYPE") or tc.get("dtype") or "auto"
-        if not isinstance(dtype, str):
-            dtype = str(dtype)
-        max_model_len = int(float(os.environ.get("VLLM_MAX_MODEL_LEN", tc.get("max_model_len", 32768))))
-        gpu_mem = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", tc.get("gpu_memory_utilization", 0.9)))
-        tensor_parallel_size = int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", tc.get("tensor_parallel_size", 1)))
-        trust_remote_code = tc.get("trust_remote_code", True)
-        if os.environ.get("VLLM_TRUST_REMOTE_CODE") is not None:
-            trust_remote_code = os.environ["VLLM_TRUST_REMOTE_CODE"].strip().lower() in (
-                "1", "true", "yes",
-            )
-
-        chunked = tc.get("enable_chunked_prefill")
-
-        async def _create_llm():
-            kwargs: dict[str, Any] = dict(
-                model=model_name,
-                kv_transfer_config=vllm.config.KVTransferConfig(
-                    kv_connector="HiddenStatesConnector",
-                    kv_role="kv_producer",
-                ),
-                dtype=dtype,
-                max_model_len=max_model_len,
-                gpu_memory_utilization=gpu_mem,
-                tensor_parallel_size=tensor_parallel_size,
-                trust_remote_code=trust_remote_code,
-                enable_prefix_caching=True,
-                enforce_eager=True, # I'm sad about this
-            )
-            if chunked is not None:
-                kwargs["enable_chunked_prefill"] = bool(chunked)
-            return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))
-
-        self._llm = asyncio.run_coroutine_threadsafe(_create_llm(), self._loop).result()
+        hf_token = os.environ.get("HF_TOKEN")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            token=os.environ.get("HF_TOKEN"),
+            token=hf_token,
             trust_remote_code=trust_remote_code,
         )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            token=hf_token,
+            trust_remote_code=trust_remote_code,
+        )
+
+        # Optional LoRA adapter recorded in the training sidecar.
+        lora_path = tc.get("lora_path") if tc.get("lora_present") else None
+        if lora_path:
+            from peft import PeftModel
+
+            print(f"[INIT] Loading LoRA adapter: {lora_path}", flush=True)
+            model = PeftModel.from_pretrained(model, str(lora_path))
+
+        self.model = model.to(self._device).eval()
+
+        eos = self.tokenizer.eos_token_id
+        if eos is None:
+            eos = getattr(self.model.config, "eos_token_id", None)
+        if isinstance(eos, int):
+            self._eos_token_ids: set[int] = {eos}
+        elif eos:
+            self._eos_token_ids = {int(t) for t in eos}
+        else:
+            self._eos_token_ids = set()
+
         print(
-            f"[INIT] Ready: {model_name} (tensor_parallel_size={tensor_parallel_size})",
+            f"[INIT] Ready: {model_name} on {self._device} (dtype={dtype}, max_len={self._max_model_len})",
             flush=True,
         )
 
@@ -337,9 +378,6 @@ class ProbeService:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _submit(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
-
     def _apply_chat_template(self, messages: list[dict]) -> str:
         # Prepend a system prompt if the first message isn't one.
         if messages and messages[0].get("role") != "system":
@@ -352,6 +390,16 @@ class ProbeService:
             add_generation_prompt=True,
             **self._chat_template_kwargs,
         )
+
+    @staticmethod
+    def _layer_hidden_state(hidden_states: tuple[torch.Tensor, ...], layer_idx: int) -> torch.Tensor:
+        """Return the hidden state of decoder layer ``layer_idx`` (vLLM/HF backend convention).
+
+        ``output_hidden_states=True`` returns ``num_layers + 1`` tensors; index 0
+        is the embedding output and index ``i+1`` is the output of decoder layer ``i``,
+        matching :class:`HFHiddenStateExtractor` and the vLLM probe plugin's layer numbering.
+        """
+        return hidden_states[layer_idx + 1]
 
     # ------------------------------------------------------------------
     # Streaming generation — yields (delta_text, token_index, per_layer_scores)
@@ -374,90 +422,104 @@ class ProbeService:
         ``per_layer_scores`` is ``[(layer_idx, score), ...]`` — one entry per
         loaded probe. Yields ``(None, None, None)`` once generation is complete.
         """
-        import vllm
-        from vllm_probe_plugin import _result_bus
-
         probes = self.get_probes(probe_path) if include_probe_scores else []
-        req_id = f"gen-{uuid.uuid4().hex[:12]}"
         prompt_str = self._apply_chat_template(messages)
 
-        sampling_params = vllm.SamplingParams(
-            temperature=temperature,
-            top_p=top_p if temperature > 0 else 1.0,
-            max_tokens=max_tokens,
+        # Chat template adds all required special tokens; encode without extras.
+        encoded = self.tokenizer(
+            prompt_str, return_tensors="pt", add_special_tokens=False
         )
+        input_ids = encoded["input_ids"].to(self._device)
+        prompt_len = int(input_ids.shape[1])
 
-        out_q: _queue.Queue = _queue.Queue()
+        budget = max(0, self._max_model_len - prompt_len)
+        if max_tokens is None:
+            max_tokens = budget
+        else:
+            max_tokens = max(0, min(int(max_tokens), budget))
 
-        async def _run():
-            prev_text = ""
+        if max_tokens == 0:
+            yield None, None, None
+            return
+
+        buffers: dict[int, deque | None] = {probe.cfg.layer_idx: None for _, probe in probes}
+        prev_text = ""
+        generated_ids: list[int] = []
+
+        with self._gen_lock, torch.no_grad():
+            # Prefill: don't capture hidden states (the probe scores completion tokens
+            # only; matching training's hs[-n_completion_tokens:] convention).
+            outputs = self.model(input_ids=input_ids, use_cache=True)
+            past_key_values = outputs.past_key_values
+            next_token = _sample_token(
+                outputs.logits[0, -1], temperature=temperature, top_p=top_p
+            )
+
+            if next_token in self._eos_token_ids:
+                yield None, None, None
+                return
+
+            generated_ids.append(next_token)
             step = 0
-            # Per-probe rolling buffers for CovSeqModel (keyed by layer_idx).
-            buffers: dict[int, deque | None] = {probe.cfg.layer_idx: None for _, probe in probes}
-            internal_req_id = None
-            try:
-                async for output in self._llm.generate(
-                    prompt=prompt_str,
-                    sampling_params=sampling_params,
-                    request_id=req_id,
-                ):
-                    if self._shutting_down or (cancel_event and cancel_event.is_set()):
-                        await self._llm.abort(req_id)
-                        return
 
-                    current_text = output.outputs[0].text
-                    delta = current_text[len(prev_text):]
-                    prev_text = current_text
-                    if not delta:
-                        continue
+            while step < max_tokens:
+                if self._shutting_down or (cancel_event and cancel_event.is_set()):
+                    break
 
-                    step += 1
-                    token_index = step - 1
+                # Forward through the just-sampled token. Its post-token hidden state
+                # is what training scored for that token (state AFTER the token).
+                inp = torch.tensor([[next_token]], dtype=torch.long, device=self._device)
+                outputs = self.model(
+                    input_ids=inp,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=bool(probes),
+                )
+                past_key_values = outputs.past_key_values
 
-                    per_layer: list[tuple[int, float]] = []
-                    if probes:
-                        internal_req_id, step_hidden = await _result_bus.read_step_async(
-                            req_id, step
+                per_layer: list[tuple[int, float]] = []
+                if probes:
+                    for _, probe in probes:
+                        layer_hs = self._layer_hidden_state(
+                            outputs.hidden_states, probe.cfg.layer_idx
                         )
-                        for _, probe in probes:
-                            hs = step_hidden.get(probe.cfg.layer_idx)
-                            if hs is None:
-                                continue
-                            score, buffers[probe.cfg.layer_idx] = run_probe_step(
-                                probe, hs, buffers[probe.cfg.layer_idx]
-                            )
-                            per_layer.append((probe.cfg.layer_idx, score))
+                        hs_step = (
+                            layer_hs[0, -1]
+                            .detach()
+                            .to("cpu", dtype=torch.float32)
+                            .unsqueeze(0)
+                        )
+                        score, buffers[probe.cfg.layer_idx] = run_probe_step(
+                            probe, hs_step, buffers[probe.cfg.layer_idx]
+                        )
+                        per_layer.append((probe.cfg.layer_idx, score))
 
-                    out_q.put((delta, token_index, per_layer if per_layer else None))
+                current_text = self.tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                )
+                delta = current_text[len(prev_text):]
+                prev_text = current_text
+                if delta:
+                    yield delta, step, per_layer if per_layer else None
 
-                if internal_req_id:
-                    _result_bus.clear(internal_req_id)
-                    _result_bus.clear_prefill(internal_req_id)
-            except Exception as exc:
-                import traceback
-                print(f"[GEN:{req_id}] ERROR: {exc}\n{traceback.format_exc()}", flush=True)
-                out_q.put(exc)
-            finally:
-                out_q.put(_DONE)
+                # Sample the next token from this step's logits.
+                step += 1
+                if step >= max_tokens:
+                    break
+                sampled = _sample_token(
+                    outputs.logits[0, -1], temperature=temperature, top_p=top_p
+                )
+                if sampled in self._eos_token_ids:
+                    break
+                next_token = sampled
+                generated_ids.append(next_token)
 
-        asyncio.run_coroutine_threadsafe(_run(), self._loop)
-
-        for item in iter(out_q.get, _DONE):
-            if isinstance(item, Exception):
-                raise item
-            yield item
-        yield None, None, None  # completion sentinel
+        yield None, None, None
 
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
         self._shutting_down = True
-        if self._llm is not None:
-            try:
-                self._llm.shutdown()
-            except Exception:
-                pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
 
 
 # ---------------------------------------------------------------------------
