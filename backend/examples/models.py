@@ -23,7 +23,7 @@ assert retrieved.id == model_id, f"id mismatch: {retrieved.id!r} != {model_id!r}
 print(f"PASS  GET /v1/models/{model_id} → {retrieved.id}")
 
 # Retrieve unknown model should 404
-import openai
+import openai  # noqa: E402
 try:
     client.models.retrieve("nonexistent-model")
     print("FAIL  GET /v1/models/nonexistent-model — expected 404, got success")

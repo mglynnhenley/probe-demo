@@ -26,7 +26,7 @@ from transformers.trainer_utils import has_length
 from vllm.lora.request import LoRARequest
 
 from data import build_probe_feature_batches, prepare_probe_batch
-from models import ValueHeadProbe
+from models import MultiProbeModel, ValueHeadProbe
 from utils import save_training_metrics_json
 from vllm_probe_plugin import extract_prefill_hidden_states
 
@@ -450,3 +450,222 @@ class ProbeTrainer(Trainer):
             / f"checkpoint-{self.state.global_step}"
         )
         save_training_metrics_json(self, checkpoint_dir / "training_metrics.json")
+
+
+class MultiProbeTrainer(ProbeTrainer):
+    """ProbeTrainer variant that trains one CovSeq probe per hidden layer jointly.
+
+    vLLM runs once per batch and returns hidden states for all requested layers.
+    Each layer's probe computes a BCE loss; the mean loss is back-propagated through
+    all probes simultaneously.  Eval metrics are averaged across layers.
+    """
+
+    def __init__(
+        self,
+        vllm_llm: vllm.LLM,
+        tokenizer: PreTrainedTokenizerBase,
+        probes: Dict[int, ValueHeadProbe],
+        train_dataset: Dataset,
+        eval_dataset: Dataset,
+        data_collator: Callable[..., Dict[str, Any]],
+        lora_request: LoRARequest | None,
+        args: TrainingArguments,
+        pos_weight: Optional[float] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        train_sampler_weights: Optional[List[float]] = None,
+        probe_training_metrics_interval_epochs: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.probes = probes
+        self.layer_indices = sorted(probes.keys())
+        multi_model = MultiProbeModel(probes)
+
+        # Bypass ProbeTrainer.__init__ (single-probe); call Trainer directly.
+        Trainer.__init__(
+            self,
+            model=multi_model,
+            processing_class=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            args=args,
+            compute_metrics=self.compute_metrics,
+            **kwargs,
+        )
+
+        self.vllm_llm = vllm_llm
+        self.pos_weight = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight is not None else None
+        self.lora_request = lora_request
+        self.chat_template_kwargs = chat_template_kwargs or {}
+        self.train_sampler_weights = train_sampler_weights
+        self.probe_training_metrics_interval_epochs = probe_training_metrics_interval_epochs
+        self._next_probe_training_metrics_epoch = (
+            probe_training_metrics_interval_epochs
+            if probe_training_metrics_interval_epochs is not None
+            and probe_training_metrics_interval_epochs > 0
+            else None
+        )
+        self._latest_probe_metrics_batches: Dict[int, Optional[torch.Tensor]] = {
+            layer: None for layer in self.layer_indices
+        }
+        self._pending_probe_metrics: Optional[Dict[str, float]] = None
+        self._linear_r2_reservoir = StreamingLinearR2Reservoir(
+            reservoir_size=8192,
+            seed=int(getattr(args, "seed", 0)),
+        )
+
+    def compute_loss(
+        self,
+        multi_probe_model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, List[str]]],
+        return_outputs: bool = False,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        prompts = inputs["prompt"]
+        completions = inputs["completion"]
+        annotations = inputs["annotations_val"].float().to(self.args.device)
+
+        prepared_batch = prepare_probe_batch(
+            self.processing_class,
+            prompts,
+            completions,
+            annotations,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+        hidden_states_dict = self._get_hidden_states(prepared_batch.token_id_lists)
+
+        # Track linear separability diagnostics using the first layer only.
+        self._update_linear_r2_reservoir(
+            hidden_states_dict[self.layer_indices[0]],
+            prepared_batch.completion_token_labels,
+        )
+
+        losses: List[torch.Tensor] = []
+        all_logits_layers: List[torch.Tensor] = []
+        all_ann_tok: Optional[torch.Tensor] = None
+
+        for layer_idx in self.layer_indices:
+            hs_list = hidden_states_dict[layer_idx]
+            feature_batches = build_probe_feature_batches(
+                hs_list,
+                prepared_batch.completion_token_labels,
+                self.probes[layer_idx].cfg.model,
+            )
+
+            seq_batches = [
+                b.features
+                for b in feature_batches
+                if isinstance(b.features, torch.Tensor) and b.features.dim() == 3
+            ]
+            if seq_batches:
+                self._latest_probe_metrics_batches[layer_idx] = max(
+                    seq_batches, key=lambda b: int(b.shape[1])
+                )
+
+            if not feature_batches:
+                continue
+
+            logits = torch.cat(
+                [multi_probe_model.forward_for_layer(layer_idx, b.features) for b in feature_batches],
+                dim=0,
+            )
+            ann_tok = torch.cat([b.labels.to(self.args.device) for b in feature_batches], dim=0)
+
+            layer_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)(
+                logits.squeeze(-1), ann_tok
+            )
+            losses.append(layer_loss)
+            all_logits_layers.append(logits.detach())
+            all_ann_tok = ann_tok
+
+        if not losses:
+            loss = torch.tensor(0.0, device=self.args.device, requires_grad=True)
+            if return_outputs:
+                return (loss, torch.empty((0, 1), device=self.args.device), torch.empty((0,), device=self.args.device))
+            return loss
+
+        loss = torch.stack(losses).mean()
+        mean_logits = torch.stack(all_logits_layers).mean(dim=0)
+
+        with torch.no_grad():
+            pred_viol = (mean_logits.squeeze(-1) > 0).float()
+            viol = all_ann_tok == 1.0
+            ok = all_ann_tok == 0.0
+            n_viol_tok = int(viol.sum().item())
+            n_nonviol_tok = int(ok.sum().item())
+            tp = pred_viol[viol].sum() if viol.any() else torch.tensor(0.0)
+            fp = pred_viol[ok].sum() if ok.any() else torch.tensor(0.0)
+            fn = (1.0 - pred_viol[viol]).sum() if viol.any() else torch.tensor(0.0)
+            prec = tp / (tp + fp + 1e-8)
+            rec = tp / (tp + fn + 1e-8)
+            f1 = 2 * prec * rec / (prec + rec + 1e-8)
+            token_accuracy = pred_viol.eq(all_ann_tok).float().mean().item()
+            metrics = {
+                "n_violation_tokens_in_batch": float(n_viol_tok),
+                "n_nonviolation_tokens_in_batch": float(n_nonviol_tok),
+                "f1": f1.item(),
+                "token_accuracy": token_accuracy,
+                "prec_viol": prec.item(),
+                "tpr": rec.item(),
+                "tnr": (1.0 - pred_viol[ok]).mean().item() if ok.any() else 0.0,
+                "frac_pred_viol": pred_viol.mean().item(),
+            }
+            if self.model.training:
+                self._pending_probe_metrics = metrics
+
+        if return_outputs:
+            return (loss, mean_logits, all_ann_tok)
+        return loss
+
+    def _maybe_print_probe_training_metrics(self) -> None:
+        interval = self.probe_training_metrics_interval_epochs
+        next_epoch = self._next_probe_training_metrics_epoch
+        if interval is None or interval <= 0 or next_epoch is None:
+            return
+
+        epoch = self.state.epoch
+        if epoch is None or epoch + 1e-12 < next_epoch:
+            return
+
+        print(f"\n[multi_probe.training_metrics] epoch={epoch:.3f}")
+        linear_r2 = self._linear_r2_reservoir.compute_r2()
+        first = self.layer_indices[0]
+        if linear_r2 is None:
+            print(
+                f"  linear_r2_raw_embeddings (layer {first}): pending "
+                f"(reservoir={self._linear_r2_reservoir.n_stored}/{self._linear_r2_reservoir.reservoir_size}, "
+                f"seen={self._linear_r2_reservoir.n_seen})"
+            )
+        else:
+            print(
+                f"  linear_r2_raw_embeddings (layer {first}): {linear_r2:.6g} "
+                f"(reservoir={self._linear_r2_reservoir.n_stored}, seen={self._linear_r2_reservoir.n_seen})"
+            )
+
+        for layer_idx in self.layer_indices:
+            probe_model = self.probes[layer_idx].model
+            metrics_fn = getattr(probe_model, "training_metrics", None)
+            batch = self._latest_probe_metrics_batches.get(layer_idx)
+            if not callable(metrics_fn) or batch is None:
+                continue
+            metrics = metrics_fn(batch)
+            print(f"  [layer {layer_idx}]")
+            for key, value in metrics.items():
+                print(f"    {key}: {value:.6g}")
+
+        while self._next_probe_training_metrics_epoch is not None and epoch + 1e-12 >= self._next_probe_training_metrics_epoch:
+            self._next_probe_training_metrics_epoch += interval
+
+    def _save_checkpoint(self, model: nn.Module, trial: Any) -> None:
+        super()._save_checkpoint(model, trial)
+        if not self.args.should_save:
+            return
+
+        checkpoint_dir = (
+            Path(self._get_output_dir(trial=trial))
+            / f"checkpoint-{self.state.global_step}"
+        )
+        for layer_idx, probe in self.probes.items():
+            probe.model.load_state_dict(self.model.models[str(layer_idx)].state_dict())
+            probe.save(checkpoint_dir / f"probe_head_layer{layer_idx}.bin")

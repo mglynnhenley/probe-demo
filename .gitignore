@@ -35,3 +35,6 @@ output/
 
 # unsloth compiled models
 unsloth_compiled_cache/
+
+# analysis results
+analysis/results**

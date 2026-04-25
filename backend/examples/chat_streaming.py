@@ -66,4 +66,4 @@ for chunk in client.chat.completions.create(
 
 assert role_chunks == ["assistant"], f"unexpected roles: {role_chunks}"
 assert content_chunks, "no content chunks"
-print(f"PASS  chunk structure (role then content)")
+print("PASS  chunk structure (role then content)")

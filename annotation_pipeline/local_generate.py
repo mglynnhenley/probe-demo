@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
 sys.path.insert(0, str(ROOT / "annotation_pipeline"))
-from data_models import GenerationRecord
+from data_models import GenerationRecord  # noqa: E402
 
 log = logging.getLogger(__name__)
 

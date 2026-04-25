@@ -1,0 +1,49 @@
+# Probe training: google/gemma-4-31B-it activations, Gemma 4 generations as training data.
+# Benchmark against the GPT-5.4-Nano probe (gemma4_31b_cluster.yaml) — same covseq architecture.
+# Run from repo root:
+#   uv run python train/train.py configs/probe/gemma4_31b_gemma4data.yaml
+
+# ── Model / vLLM ───────────────────────────────────────────────────────────────
+model_name: google/gemma-4-31B-it
+dtype: auto
+max_model_len: 2048
+gpu_memory_utilization: 0.9
+tensor_parallel_size: 4  # 4×V100; set to 1 for H200
+layer_idx: 45             # Gemma 4 31B has 60 layers (0–59)
+trust_remote_code: true
+
+chat_template_kwargs:
+  enable_thinking: false
+
+lora_present: false
+lora_path: output/lora_adapter/
+
+# ── Probe head ─────────────────────────────────────────────────────────────────
+probe:
+  probe_model_type: covseq
+  hidden_sizes: [128]
+  output_size: 1
+  covseq:
+    window_size: 8
+    compressed_size: 64
+    training_metrics_interval_epochs: 1.0
+
+# ── Data ───────────────────────────────────────────────────────────────────────
+annotations_jsonl: data/gemma4_annotated.jsonl
+val_fraction: 0.1
+pos_weight: auto
+pos_weight_max: null
+
+# ── Training ───────────────────────────────────────────────────────────────────
+epochs: 5
+train_batch_size: 16
+grad_accumulation_steps: 4
+probe_lr: 1.0e-3
+warmup_steps: 50
+max_grad_norm: 1.0
+val_interval: 14
+log_interval: 1
+checkpoint_interval: 28
+
+output_dir: output/gemma4_31b_probe_gemma4data
+seed: 42

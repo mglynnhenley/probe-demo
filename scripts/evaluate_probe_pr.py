@@ -132,13 +132,11 @@ def _run_full_pipeline(
     config_path: Path,
     split: str,
     batch_size: int | None,
+    probe_path: Path | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run inference + probe scoring; return (logits, labels)."""
-    import vllm
     import vllm_probe_plugin
     from vllm.lora.request import LoRARequest
-    from tqdm.auto import tqdm
-    from datasets import Dataset
     from evaluate_probe_roc import (
         load_training_config,
         score_dataset,
@@ -161,7 +159,11 @@ def _run_full_pipeline(
     resolve_gpu_counts = utils_module.resolve_gpu_counts
 
     cfg = load_training_config(config_path.expanduser().resolve())
-    probe_path = Path(cfg.output_dir).resolve() / "probe_head.bin"
+    probe_path = (
+        probe_path.expanduser().resolve()
+        if probe_path is not None
+        else Path(cfg.output_dir).resolve() / "probe_head.bin"
+    )
     if not probe_path.is_file():
         raise SystemExit(f"Probe checkpoint not found: {probe_path}")
 
@@ -249,6 +251,12 @@ def _run_full_pipeline(
     help="Load pre-computed scores from .npz (skips re-running inference).",
 )
 @click.option(
+    "--probe-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to probe_head.bin (default: <output_dir>/probe_head.bin).",
+)
+@click.option(
     "--split",
     type=click.Choice(["all", "train", "eval"]),
     default="all",
@@ -269,6 +277,7 @@ def _run_full_pipeline(
 def main(
     config_path: Path | None,
     npz: Path | None,
+    probe_path: Path | None,
     split: str,
     batch_size: int | None,
     output_prefix: Path | None,
@@ -279,7 +288,7 @@ def main(
         if output_prefix is None:
             output_prefix = npz.parent / f"probe_pr_{split}"
     elif config_path is not None:
-        logits, labels = _run_full_pipeline(config_path, split, batch_size)
+        logits, labels = _run_full_pipeline(config_path, split, batch_size, probe_path)
         if output_prefix is None:
             cfg_module = importlib.import_module("config")
             cfg = cfg_module.TrainingConfig.from_yaml(config_path.expanduser().resolve())

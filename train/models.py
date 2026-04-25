@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file as _safetensors_load
 
 
 @dataclass
@@ -201,6 +202,18 @@ class CovSeqModel(nn.Module):
         }
 
 
+class MultiProbeModel(nn.Module):
+    """Holds one probe nn.Module per layer index for joint multi-layer training."""
+
+    def __init__(self, probes: "Dict[int, ValueHeadProbe]") -> None:
+        super().__init__()
+        self.models = nn.ModuleDict({str(k): v.model for k, v in probes.items()})
+        self.layer_indices: List[int] = sorted(int(k) for k in probes.keys())
+
+    def forward_for_layer(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+        return self.models[str(layer_idx)](x)
+
+
 class ValueHeadProbe:
     """Wraps the probe MLP plus :class:`ProbeConfig` (architecture and provenance)."""
 
@@ -262,12 +275,18 @@ class ValueHeadProbe:
     def load_from_state_dict(self) -> None:
         if self.cfg.path is None:
             raise ValueError("ProbeConfig.path is not set")
-        payload = torch.load(self.cfg.path, map_location="cpu")
-        if isinstance(payload, dict) and "state_dict" in payload:
-            saved_cfg_raw = payload.get("probe_config")
-            if isinstance(saved_cfg_raw, dict):
-                self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
-            state_dict = payload["state_dict"]
+        path = Path(self.cfg.path)
+        if path.suffix == ".safetensors":
+            # HuggingFace Trainer checkpoints — flat state dict, no probe_config wrapper
+            state_dict = _safetensors_load(str(path), device="cpu")
         else:
-            state_dict = payload
+            # Custom probe.bin saved via ValueHeadProbe.save()
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and "state_dict" in payload:
+                saved_cfg_raw = payload.get("probe_config")
+                if isinstance(saved_cfg_raw, dict):
+                    self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
+                state_dict = payload["state_dict"]
+            else:
+                state_dict = payload
         self.model.load_state_dict(state_dict)
