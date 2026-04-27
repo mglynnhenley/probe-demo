@@ -30,7 +30,7 @@ from data import (
     truncate_dataset,
 )
 from models import ProbeConfig, ProbeModelConfig, ValueHeadProbe
-from trainer import MultiProbeTrainer, ProbeTrainer
+from trainer import ProbeTrainer
 from utils import (
     effective_probe_max_model_len,
     get_compute_capability,
@@ -47,14 +47,14 @@ from vllm_probe_plugin.utils import hidden_size_from_hf_config
 def load_training_config(path: Path) -> TrainingConfig:
     """Load YAML and resolve ``dtype`` when unset or ``auto`` (compute-capability based on CUDA)."""
     cfg = TrainingConfig.from_yaml(path)
-    if cfg.dtype in (None, "auto"):
+    if cfg.dtype is None:
         if torch.cuda.is_available():
             cfg.dtype = get_dtype()
-            print(f"[dtype] {cfg.dtype!r} (from GPU compute capability)")
+            print(f"[dtype] {cfg.dtype} (from GPU compute capability)")
         else:
             print("[dtype] None — no CUDA; vLLM will use its default resolution")
     else:
-        print(f"[dtype] {cfg.dtype!r} (from config)")
+        print(f"[dtype] {cfg.dtype} (from config)")
     return cfg
 
 
@@ -125,10 +125,6 @@ def main(config_path: Path) -> None:
 
     vllm_probe_plugin.register()
 
-    layer_list = cfg.layer_indices if cfg.layer_indices else [cfg.layer_idx]
-    if cfg.layer_indices:
-        print(f"[multi-layer] training probes on {len(layer_list)} layers: {layer_list}")
-
     tp, dp = resolve_gpu_counts(cfg.tensor_parallel_size)
     major_cc = get_compute_capability() if torch.cuda.is_available() else 0
     if cfg.enable_chunked_prefill is not None:
@@ -144,10 +140,11 @@ def main(config_path: Path) -> None:
         f"chunked_prefill={chunked_prefill})"
     )
 
+    active_layers = cfg.probe.layer_indices if cfg.probe.layer_indices else [cfg.layer_idx]
     llm = configure_llm(
         model=cfg.model_name,
-        layers=layer_list,
-        dtype=cfg.dtype,
+        layers=active_layers,
+        dtype=str(cfg.dtype).replace("torch.", "") if cfg.dtype is not None else "auto",
         max_model_len=cfg.max_model_len,
         tensor_parallel_size=tp,
         data_parallel_size=dp,
@@ -185,11 +182,38 @@ def main(config_path: Path) -> None:
         hidden_sizes=list(cfg.probe.hidden_sizes),
         output_size=cfg.probe.output_size,
         covseq=cfg.probe.covseq,
+        layer_indices=list(cfg.probe.layer_indices),
     )
     if cfg.probe.hidden_size not in (0, resolved_hidden_size):
         print(
             f"[probe] hidden_size from model config is {resolved_hidden_size}; "
             f"overriding YAML value {cfg.probe.hidden_size}"
+        )
+    probe_cfg = ProbeConfig(
+        layer_idx=cfg.layer_idx,
+        model=probe_model_cfg,
+        underlying_model=cfg.model_name,
+        policy=None,
+    )
+    probe = ValueHeadProbe(probe_cfg)
+    # Cast probe weights to match the dtype vLLM actually loaded the model in,
+    # which is the ground truth regardless of what cfg.dtype resolved to.
+    vllm_dtype = llm.llm_engine.model_config.dtype
+    probe.model = probe.model.to(vllm_dtype)
+    print(f"[probe] weights cast to {vllm_dtype} (from vLLM model config)")
+    if probe_model_cfg.model_type == "multi_layer_covseq":
+        print(
+            f"[probe] model_type=multi_layer_covseq, hidden_size={resolved_hidden_size}, "
+            f"n_layers={len(probe_model_cfg.layer_indices)}, "
+            f"layer_indices={probe_model_cfg.layer_indices}, "
+            f"window_size={probe.cfg.model.covseq.window_size}, "
+            f"compressed_size={probe.cfg.model.covseq.compressed_size}"
+        )
+    else:
+        print(
+            f"[probe] model_type={probe.cfg.model.model_type}, hidden_size={resolved_hidden_size}, "
+            f"window_size={probe.cfg.model.covseq.window_size}, "
+            f"compressed_size={probe.cfg.model.covseq.compressed_size}"
         )
 
     kv_max_batch = optimal_batch_size(llm, effective_mml)
@@ -335,9 +359,10 @@ def main(config_path: Path) -> None:
                 f"[debug_sampling] BCE pos_weight scalar used in loss = {float(pos_weight):.6f}"
             )
 
-    _trainer_kwargs = dict(
+    trainer = ProbeTrainer(
         vllm_llm=llm,
         tokenizer=tokenizer,
+        probe=probe,
         pos_weight=pos_weight,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -348,41 +373,6 @@ def main(config_path: Path) -> None:
         train_sampler_weights=sampler_weights,
         probe_training_metrics_interval_epochs=cfg.probe.covseq.training_metrics_interval_epochs,
     )
-
-    if cfg.layer_indices:
-        probes = {
-            layer_idx: ValueHeadProbe(
-                ProbeConfig(
-                    layer_idx=layer_idx,
-                    model=probe_model_cfg,
-                    underlying_model=cfg.model_name,
-                    policy=None,
-                )
-            )
-            for layer_idx in cfg.layer_indices
-        }
-        print(
-            f"[probe] model_type={cfg.probe.probe_model_type}, n_layers={len(probes)}, "
-            f"hidden_size={resolved_hidden_size}, "
-            f"window_size={cfg.probe.covseq.window_size}, "
-            f"compressed_size={cfg.probe.covseq.compressed_size}"
-        )
-        trainer = MultiProbeTrainer(probes=probes, **_trainer_kwargs)
-    else:
-        probe = ValueHeadProbe(
-            ProbeConfig(
-                layer_idx=cfg.layer_idx,
-                model=probe_model_cfg,
-                underlying_model=cfg.model_name,
-                policy=None,
-            )
-        )
-        print(
-            f"[probe] model_type={probe.cfg.model.model_type}, hidden_size={resolved_hidden_size}, "
-            f"window_size={probe.cfg.model.covseq.window_size}, "
-            f"compressed_size={probe.cfg.model.covseq.compressed_size}"
-        )
-        trainer = ProbeTrainer(probe=probe, **_trainer_kwargs)
 
     trainer.remove_callback(PrinterCallback)
     trainer.remove_callback(ProgressCallback)
@@ -395,23 +385,12 @@ def main(config_path: Path) -> None:
 
     metrics_path = Path(cfg.output_dir) / "training_metrics.json"
     save_training_metrics_json(trainer, metrics_path)
-    save_training_config_json(cfg, Path(cfg.output_dir) / "config.json")
 
-    if cfg.layer_indices:
-        for layer_idx, probe in trainer.probes.items():
-            probe.model.load_state_dict(trainer.model.models[str(layer_idx)].state_dict())
-            layer_dir = Path(cfg.output_dir) / f"layer_{layer_idx}"
-            layer_dir.mkdir(parents=True, exist_ok=True)
-            probe.save(layer_dir / "probe_head.bin")
-        print(
-            f"Saved {len(trainer.probes)} probes to {cfg.output_dir}/layer_*/probe_head.bin, "
-            f"config.json, and {metrics_path.name}"
-        )
-    else:
-        probe.save(Path(cfg.output_dir) / "probe_head.bin")
-        print(
-            f"Saved probe to {cfg.output_dir}/probe_head.bin, config.json, and {metrics_path.name}"
-        )
+    probe.save(Path(cfg.output_dir) / "probe_head.bin")
+    save_training_config_json(cfg, Path(cfg.output_dir) / "config.json")
+    print(
+        f"Saved probe to {cfg.output_dir}/probe_head.bin, config.json, and {metrics_path.name}"
+    )
 
 
 if __name__ == "__main__":

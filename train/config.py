@@ -6,9 +6,19 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin, get_type_hints
 
+import torch
 import yaml
 
 from models import ProbeModelConfig
+
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp32": torch.float32,
+}
 
 
 @dataclass
@@ -17,8 +27,8 @@ class TrainingConfig:
 
     # ── Model / vLLM ─────────────────────────────────────────────────────
     model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    # None or "auto": after load, set from compute capability (CUDA) via get_dtype(); else explicit string
-    dtype: Optional[str] = None
+    # None/"auto" in YAML → resolved from GPU compute capability in train.py; else "bfloat16"/"float16"/"float32"
+    dtype: Optional[torch.dtype] = None
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.75
     # None: enable chunked prefill only on Ampere+ (cc>=8); false saves VRAM on V100/Pascal.
@@ -82,7 +92,16 @@ class TrainingConfig:
         for key, value in raw.items():
             if key not in valid:
                 raise ValueError(f"Unknown config key: {key!r} (valid: {sorted(valid)})")
-            setattr(cfg, key, _coerce_dataclass_field(type_hints.get(key, valid[key].type), value))
+            if key == "dtype":
+                # "auto" and None are resolved later in train.py after CUDA is available.
+                if value in (None, "auto"):
+                    cfg.dtype = None
+                else:
+                    cfg.dtype = _DTYPE_MAP.get(str(value).lower())
+                    if cfg.dtype is None:
+                        raise ValueError(f"Unknown dtype {value!r}. Valid: {sorted(_DTYPE_MAP)}")
+            else:
+                setattr(cfg, key, _coerce_dataclass_field(type_hints.get(key, valid[key].type), value))
         return cfg
 
 

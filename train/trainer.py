@@ -207,6 +207,20 @@ class ProbeTrainer(Trainer):
         return hidden_states_dict
 
     def _stash_probe_metrics_batch(self, feature_batches: List[Any]) -> None:
+        if feature_batches and isinstance(feature_batches[0], list):
+            # multi_layer_covseq: feature_batches is List[List[ProbeFeatureBatch]]
+            # stash as a list of the longest-window tensor per layer
+            result = []
+            for layer_batches in feature_batches:
+                seq_batches = [
+                    b.features for b in layer_batches
+                    if isinstance(b.features, torch.Tensor) and b.features.dim() == 3
+                ]
+                result.append(
+                    max(seq_batches, key=lambda t: int(t.shape[1])) if seq_batches else None
+                )
+            self._latest_probe_metrics_batch = result if any(x is not None for x in result) else None
+            return
         seq_batches = [
             batch.features
             for batch in feature_batches
@@ -295,15 +309,27 @@ class ProbeTrainer(Trainer):
         )
 
         hidden_states_dict = self._get_hidden_states(prepared_batch.token_id_lists)
-        hidden_states_list = hidden_states_dict[self.probe.layer_idx]
-        self._update_linear_r2_reservoir(
-            hidden_states_list,
-            prepared_batch.completion_token_labels,
-        )
+        model_cfg = self.probe.cfg.model
+        if model_cfg.model_type == "multi_layer_covseq":
+            # Dict[layer_idx -> List[Tensor]] ordered by layer_indices
+            hidden_states_per_layer = [
+                hidden_states_dict[li] for li in model_cfg.layer_indices
+            ]
+            # Use first layer for R² reservoir diagnostic
+            self._update_linear_r2_reservoir(
+                hidden_states_per_layer[0],
+                prepared_batch.completion_token_labels,
+            )
+        else:
+            hidden_states_per_layer = hidden_states_dict[self.probe.layer_idx]
+            self._update_linear_r2_reservoir(
+                hidden_states_per_layer,
+                prepared_batch.completion_token_labels,
+            )
         feature_batches = build_probe_feature_batches(
-            hidden_states_list,
+            hidden_states_per_layer,
             prepared_batch.completion_token_labels,
-            self.probe.cfg.model,
+            model_cfg,
         )
         self._stash_probe_metrics_batch(feature_batches)
 
@@ -315,7 +341,11 @@ class ProbeTrainer(Trainer):
                 return (loss, empty_logits, empty_labels)
             return loss
 
-        logits = torch.cat([probe_model(batch.features) for batch in feature_batches], dim=0)
+        logits = torch.cat([
+            probe_model(batch.features) if not isinstance(batch.features, list)
+            else probe_model([f.to(self.args.device) for f in batch.features])
+            for batch in feature_batches
+        ], dim=0)
         ann_tok = torch.cat([batch.labels.to(self.args.device) for batch in feature_batches], dim=0)
 
         loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)(

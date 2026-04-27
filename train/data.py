@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 from datasets import Dataset, DatasetDict
+from tqdm import tqdm
 from torch.nn.utils.rnn import pad_sequence
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -40,11 +41,19 @@ class ProbeFeatureBatch:
     labels: torch.Tensor
 
 
+_HALLUCINATION_LABELS = {"Not Supported", "Insufficient Information"}
+
+
 def _map_violation_spans_to_val(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Replace `annotations` with `annotations_val`: one float per completion character.
 
-    - 0.0 = not labelled as a violation (default for every character).
-    - 1.0 = character falls inside an annotated violation span (uses `index` + `span` length).
+    - 0.0 = not a violation (default).
+    - 1.0 = character falls inside a violation span.
+
+    For policy-violation annotations (no ``label`` field), every span is treated as a
+    violation. For hallucination annotations (``label`` field present), only spans with
+    label ``"Not Supported"`` or ``"Insufficient Information"`` are treated as violations;
+    ``"Supported"`` spans are skipped.
     """
     for index, line in enumerate(data):
         completion = line["completion"]
@@ -53,6 +62,9 @@ def _map_violation_spans_to_val(data: List[Dict[str, Any]]) -> List[Dict[str, An
 
         for span in annotations_list:
             if not isinstance(span, dict):
+                continue
+            label = span.get("label")
+            if label is not None and label not in _HALLUCINATION_LABELS:
                 continue
             start = span.get("index")
             if start is None:
@@ -156,8 +168,59 @@ def prepare_probe_batch(
     )
 
 
-def build_probe_feature_batches(
+def _covseq_windows(
     hidden_states_list: List[torch.Tensor],
+    completion_token_labels: List[torch.Tensor],
+    window_size: int,
+) -> Dict[int, tuple]:
+    """Build CovSeq sliding-window buckets for one layer.
+
+    Returns a dict mapping seq_len -> (stacked_windows, stacked_labels).
+    """
+    # Buckets hold chunks to be cat'd; avoids O(N) Python list decomposition per sequence.
+    buckets: dict[int, List[torch.Tensor]] = {}
+    label_buckets: dict[int, List[torch.Tensor]] = {}
+
+    for hidden_states, token_labels in zip(hidden_states_list, completion_token_labels):
+        n_completion_tokens = int(token_labels.shape[0])
+        hs = hidden_states[-n_completion_tokens:] if n_completion_tokens else hidden_states[:0]
+        n_tokens = min(hs.shape[0], token_labels.shape[0])
+        if n_tokens == 0:
+            continue
+
+        hs = hs[:n_tokens].contiguous()
+        token_labels = token_labels[:n_tokens].float()  # labels stay float32 for BCE
+
+        # Prefix windows (seq_len < window_size): unavoidably variable-length, one per token.
+        prefix_limit = min(window_size - 1, n_tokens)
+        for seq_len in range(1, prefix_limit + 1):
+            label = token_labels[seq_len - 1]
+            if label == -100:
+                continue
+            buckets.setdefault(seq_len, []).append(hs[:seq_len].unsqueeze(0))
+            label_buckets.setdefault(seq_len, []).append(label.unsqueeze(0))
+
+        if n_tokens >= window_size:
+            # stride_tricks gives a view — index directly into hs without materialising indices.
+            full_windows = hs.unfold(0, window_size, 1)  # [n_windows, hidden_size, window_size]
+            full_windows = full_windows.permute(0, 2, 1)  # [n_windows, window_size, hidden_size]
+            full_labels = token_labels[window_size - 1:]
+            keep = full_labels != -100
+            if keep.any():
+                buckets.setdefault(window_size, []).append(full_windows[keep])
+                label_buckets.setdefault(window_size, []).append(full_labels[keep])
+
+    return {
+        seq_len: (
+            torch.cat(buckets[seq_len], dim=0),
+            torch.cat(label_buckets[seq_len], dim=0),
+        )
+        for seq_len in sorted(buckets)
+    }
+
+
+def build_probe_feature_batches(
+    hidden_states_list,
     completion_token_labels: List[torch.Tensor],
     model_cfg: ProbeModelConfig,
 ) -> List[ProbeFeatureBatch]:
@@ -167,7 +230,47 @@ def build_probe_feature_batches(
     :func:`numpy.lib.stride_tricks.sliding_window_view`; the shorter prefix windows
     that occur near the start of each completion are added separately so the effective
     sequence length is truncated instead of padded.
+
+    For ``multi_layer_covseq``, ``hidden_states_list`` is
+    ``List[List[Tensor]]`` (one inner list per layer, each containing one tensor per
+    sequence). Each :class:`ProbeFeatureBatch` has ``features`` as a
+    ``List[Tensor]`` — one ``[batch, seq_len, hidden_size]`` tensor per layer —
+    and ``labels`` as the shared label tensor.
     """
+    if model_cfg.model_type == "multi_layer_covseq":
+        # hidden_states_list: List[List[Tensor]], outer = layers, inner = sequences
+        n_layers = len(hidden_states_list)
+        if n_layers == 0:
+            return []
+        n_seqs = len(hidden_states_list[0])
+        if any(len(hs) != n_seqs for hs in hidden_states_list):
+            raise ValueError("All layers must have the same number of sequences")
+        if n_seqs != len(completion_token_labels):
+            raise ValueError(
+                "hidden_states_list and completion_token_labels must have the same length"
+            )
+
+        window_size = model_cfg.covseq.window_size
+        # Build windows for each layer; labels are shared so we take them from layer 0
+        layer_windows = [
+            _covseq_windows(hidden_states_list[li], completion_token_labels, window_size)
+            for li in range(n_layers)
+        ]
+        # Intersect seq_lens present in all layers
+        common_seq_lens = sorted(
+            set(layer_windows[0].keys()).intersection(*[set(lw.keys()) for lw in layer_windows[1:]])
+        )
+        if not common_seq_lens:
+            return []
+
+        feature_batches: List[ProbeFeatureBatch] = []
+        for seq_len in common_seq_lens:
+            # features: list of [batch, seq_len, hidden_size] tensors, one per layer
+            layer_tensors = [layer_windows[li][seq_len][0] for li in range(n_layers)]
+            labels = layer_windows[0][seq_len][1]
+            feature_batches.append(ProbeFeatureBatch(features=layer_tensors, labels=labels))
+        return feature_batches
+
     if len(hidden_states_list) != len(completion_token_labels):
         raise ValueError(
             "hidden_states_list and completion_token_labels must have the same length"
@@ -186,8 +289,8 @@ def build_probe_feature_batches(
             keep = token_labels != -100
             if not keep.any():
                 continue
-            features.append(completion_hidden_states[:n_tokens][keep].float())
-            labels.append(token_labels[keep].float())
+            features.append(completion_hidden_states[:n_tokens][keep])
+            labels.append(token_labels[keep].float())  # labels stay float32 for BCE
         if not features:
             return []
         return [ProbeFeatureBatch(features=torch.cat(features, dim=0), labels=torch.cat(labels, dim=0))]
@@ -195,50 +298,11 @@ def build_probe_feature_batches(
     if model_cfg.model_type != "covseq":
         raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
 
-    window_size = model_cfg.covseq.window_size
-    buckets: dict[int, List[torch.Tensor]] = {}
-    label_buckets: dict[int, List[torch.Tensor]] = {}
-
-    for hidden_states, token_labels in zip(hidden_states_list, completion_token_labels):
-        n_completion_tokens = int(token_labels.shape[0])
-        completion_hidden_states = hidden_states[-n_completion_tokens:] if n_completion_tokens else hidden_states[:0]
-        n_tokens = min(completion_hidden_states.shape[0], token_labels.shape[0])
-        if n_tokens == 0:
-            continue
-
-        hidden_states = completion_hidden_states[:n_tokens].float().contiguous()
-        token_labels = token_labels[:n_tokens].float()
-
-        prefix_limit = min(window_size - 1, n_tokens)
-        for seq_len in range(1, prefix_limit + 1):
-            label = token_labels[seq_len - 1]
-            if label == -100:
-                continue
-            buckets.setdefault(seq_len, []).append(hidden_states[:seq_len])
-            label_buckets.setdefault(seq_len, []).append(label)
-
-        if n_tokens >= window_size:
-            token_indices = np.arange(n_tokens)
-            window_indices_np = np.lib.stride_tricks.sliding_window_view(
-                token_indices, window_shape=window_size
-            )
-            window_indices = torch.from_numpy(window_indices_np.copy()).long()
-            full_windows = hidden_states[window_indices]
-            full_labels = token_labels[window_size - 1 :]
-            keep = full_labels != -100
-            if keep.any():
-                buckets.setdefault(window_size, []).extend(list(full_windows[keep]))
-                label_buckets.setdefault(window_size, []).extend(list(full_labels[keep]))
-
-    feature_batches: List[ProbeFeatureBatch] = []
-    for seq_len in sorted(buckets):
-        feature_batches.append(
-            ProbeFeatureBatch(
-                features=torch.stack(buckets[seq_len], dim=0),
-                labels=torch.stack(label_buckets[seq_len], dim=0),
-            )
-        )
-    return feature_batches
+    windows = _covseq_windows(hidden_states_list, completion_token_labels, model_cfg.covseq.window_size)
+    return [
+        ProbeFeatureBatch(features=feats, labels=labs)
+        for feats, labs in windows.values()
+    ]
 
 
 def count_violation_and_nonviolation_completion_tokens(
@@ -248,7 +312,7 @@ def count_violation_and_nonviolation_completion_tokens(
 ) -> tuple[int, int]:
     """Return ``(n_violation, n_nonviolation)`` over **completion token** labels (see :func:`probe_completion_token_labels`)."""
     n_violation = n_nonviolation = 0
-    for example in dataset:
+    for example in tqdm(dataset, desc="Class balance", unit="rec", leave=False):
         tok = probe_completion_token_labels(
             tokenizer,
             example["prompt"],
@@ -385,7 +449,7 @@ def train_sampler_weights_and_effective_pos_weight(
     """
     weights: List[float] = []
     sw_pos = sw_neg = 0.0
-    for i in range(len(train_dataset)):
+    for i in tqdm(range(len(train_dataset)), desc="Sampler weights", unit="rec", leave=False):
         ex = train_dataset[i]
         n_pos, n_neg = completion_token_pos_neg_counts(ex, tokenizer, chat_template_kwargs)
         w = row_sampler_weight_from_token_counts(n_pos, n_neg, w_min=w_min, w_max=w_max)
@@ -505,7 +569,7 @@ def compute_pos_weight(
     violations are extremely rare.
     """
     n_pos = n_neg = 0
-    for example in dataset:
+    for example in tqdm(dataset, desc="Pos weight", unit="rec", leave=False):
         np_i, nn_i = completion_token_pos_neg_counts(example, tokenizer, chat_template_kwargs)
         n_pos += np_i
         n_neg += nn_i

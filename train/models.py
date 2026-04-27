@@ -7,11 +7,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as _safetensors_load
 
 
 @dataclass
@@ -32,6 +31,9 @@ class ProbeModelConfig:
     hidden_sizes: List[int] = field(default_factory=list)
     output_size: int = 1
     covseq: CovSeqConfig = field(default_factory=CovSeqConfig)
+    # For multi_layer_covseq: list of layer indices to pool and concatenate.
+    # Empty means single-layer mode (use ProbeConfig.layer_idx).
+    layer_indices: List[int] = field(default_factory=list)
 
     @property
     def model_type(self) -> str:
@@ -202,16 +204,75 @@ class CovSeqModel(nn.Module):
         }
 
 
-class MultiProbeModel(nn.Module):
-    """Holds one probe nn.Module per layer index for joint multi-layer training."""
+class MultiLayerCovSeqModel(nn.Module):
+    """Per-layer CovSeq pooling concatenated into a single MLP.
 
-    def __init__(self, probes: "Dict[int, ValueHeadProbe]") -> None:
+    Each layer gets its own independent L/R compressors. Their pooled covariance
+    matrices (each ``compressed_size²``-dim) are concatenated and fed through a
+    shared MLP to produce a single scalar per token window.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        compressed_size: int,
+        input_size: int,
+        hidden_sizes: List[int],
+        output_size: int,
+    ) -> None:
         super().__init__()
-        self.models = nn.ModuleDict({str(k): v.model for k, v in probes.items()})
-        self.layer_indices: List[int] = sorted(int(k) for k in probes.keys())
+        self.n_layers = n_layers
+        self.compressed_size = compressed_size
+        # One pair of compressors per layer; no output MLP on each (pool only)
+        self.L_layers = nn.ModuleList(
+            [nn.Linear(input_size, compressed_size, bias=False) for _ in range(n_layers)]
+        )
+        self.R_layers = nn.ModuleList(
+            [nn.Linear(input_size, compressed_size, bias=False) for _ in range(n_layers)]
+        )
+        self.mlp = MLP(
+            input_size=n_layers * compressed_size ** 2,
+            hidden_sizes=hidden_sizes,
+            output_size=output_size,
+        )
 
-    def forward_for_layer(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
-        return self.models[str(layer_idx)](x)
+    def pool_layer(self, X: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """Pool one layer's hidden states into a compressed covariance matrix.
+
+        X: [batch, seq_len, hidden_size]
+        returns: [batch, compressed_size * compressed_size]
+        """
+        seq_len = X.shape[1]
+        XL = self.L_layers[layer_idx](X)
+        XR = self.R_layers[layer_idx](X)
+        M = XL.mT @ XR / seq_len
+        return M.view(M.shape[0], -1)
+
+    def forward(self, X_per_layer: List[torch.Tensor]) -> torch.Tensor:
+        """
+        X_per_layer: list of n_layers tensors each [batch, seq_len, hidden_size]
+        returns: [batch, output_size]
+        """
+        pooled = [self.pool_layer(X, i) for i, X in enumerate(X_per_layer)]
+        cat = torch.cat(pooled, dim=-1)
+        return self.mlp(cat)
+
+    def training_metrics(self, X_per_layer: List[torch.Tensor]) -> dict:
+        metrics: dict = {}
+        for i, X in enumerate(X_per_layer):
+            with torch.no_grad():
+                M = self.pool_layer(X, i).view(X.shape[0], self.compressed_size, self.compressed_size)
+                metrics[f"layer{i}_M_variance"] = M.flatten(start_dim=1).var(dim=0).mean().item()
+                metrics[f"layer{i}_M_rank"] = torch.linalg.matrix_rank(M).float().mean().item()
+        mlp_grad_norms = [
+            torch.norm(p.grad, "fro")
+            for p in self.mlp.parameters()
+            if p.grad is not None and p.dim() == 2
+        ]
+        metrics["mlp_grad_norm"] = (
+            torch.norm(torch.stack(mlp_grad_norms)).item() if mlp_grad_norms else 0.0
+        )
+        return metrics
 
 
 class ValueHeadProbe:
@@ -220,7 +281,7 @@ class ValueHeadProbe:
     def __init__(self, cfg: ProbeConfig) -> None:
         self.cfg = cfg
         self.layer_idx = cfg.layer_idx
-        self.model = self._build_model().float()
+        self.model = self._build_model()
         if cfg.path is not None:
             self.load_from_state_dict()
 
@@ -241,13 +302,26 @@ class ValueHeadProbe:
                 hidden_sizes=model_cfg.hidden_sizes,
                 output_size=model_cfg.output_size,
             )
+        if model_cfg.model_type == "multi_layer_covseq":
+            if model_cfg.covseq.window_size < 2:
+                raise ValueError("covseq.window_size must be at least 2")
+            n = len(model_cfg.layer_indices)
+            if n < 2:
+                raise ValueError("multi_layer_covseq requires at least 2 layer_indices")
+            return MultiLayerCovSeqModel(
+                n_layers=n,
+                compressed_size=model_cfg.covseq.compressed_size,
+                input_size=model_cfg.hidden_size,
+                hidden_sizes=model_cfg.hidden_sizes,
+                output_size=model_cfg.output_size,
+            )
         raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
 
     def _validate_loaded_config(self, saved_cfg: ProbeConfig) -> None:
         current = self.cfg.model
         saved = saved_cfg.model
         mismatches: list[str] = []
-        fields_to_check = ("probe_model_type", "hidden_size", "hidden_sizes", "output_size")
+        fields_to_check = ("probe_model_type", "hidden_size", "hidden_sizes", "output_size", "layer_indices")
         for field_name in fields_to_check:
             if getattr(current, field_name) != getattr(saved, field_name):
                 mismatches.append(
@@ -275,18 +349,12 @@ class ValueHeadProbe:
     def load_from_state_dict(self) -> None:
         if self.cfg.path is None:
             raise ValueError("ProbeConfig.path is not set")
-        path = Path(self.cfg.path)
-        if path.suffix == ".safetensors":
-            # HuggingFace Trainer checkpoints — flat state dict, no probe_config wrapper
-            state_dict = _safetensors_load(str(path), device="cpu")
+        payload = torch.load(self.cfg.path, map_location="cpu")
+        if isinstance(payload, dict) and "state_dict" in payload:
+            saved_cfg_raw = payload.get("probe_config")
+            if isinstance(saved_cfg_raw, dict):
+                self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
+            state_dict = payload["state_dict"]
         else:
-            # Custom probe.bin saved via ValueHeadProbe.save()
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            if isinstance(payload, dict) and "state_dict" in payload:
-                saved_cfg_raw = payload.get("probe_config")
-                if isinstance(saved_cfg_raw, dict):
-                    self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
-                state_dict = payload["state_dict"]
-            else:
-                state_dict = payload
+            state_dict = payload
         self.model.load_state_dict(state_dict)

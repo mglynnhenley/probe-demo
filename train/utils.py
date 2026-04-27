@@ -193,11 +193,11 @@ def get_compute_capability(device_idx: int = 0) -> int:
     return torch.cuda.get_device_capability(device_idx)[0]
 
 
-def get_dtype(device_idx: int = 0) -> str:
-    """Pick a load dtype from GPU capability: Ampere+ → ``bfloat16``, else ``float16``."""
+def get_dtype(device_idx: int = 0) -> torch.dtype:
+    """Pick a dtype from GPU capability: Ampere+ → bfloat16, else float16."""
     if get_compute_capability(device_idx) >= 8:
-        return "bfloat16"
-    return "float16"
+        return torch.bfloat16
+    return torch.float16
 
 
 def resolve_gpu_counts(tp_required: int) -> tuple[int, int]:

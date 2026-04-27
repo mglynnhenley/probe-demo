@@ -26,6 +26,8 @@ backups/
 data/**
 backup_data/**
 !/data/.gitkeep
+backup_data*/**
+financial_advice_data/**
 
 # development
 dev_scripts/
