@@ -425,8 +425,10 @@ def train_sampler_weights_and_effective_pos_weight(
     *,
     w_min: float = 1.0,
     w_max: float = 10.0,
-) -> tuple[List[float], float]:
+) -> tuple[List[float], float, float]:
     """Build per-row sampler weights and BCE ``pos_weight`` consistent with weighted row sampling.
+
+    Returns ``(weights, effective_pos_weight, raw_pos_weight)`` in a single pass.
 
     **Sampler.** Row ``i`` is drawn with probability proportional to ``w_i`` from
     :func:`row_sampler_weight_from_token_counts` (linear in violation **fraction** per row,
@@ -440,15 +442,12 @@ def train_sampler_weights_and_effective_pos_weight(
     :class:`~torch.nn.BCEWithLogitsLoss` ``pos_weight`` is meant to correct when set to
     ``n_neg/n_pos`` for the training distribution.
 
-    **Unweighted** :func:`compute_pos_weight` (dataset-wide, no ``w_i``) stays useful for logging
-    and comparing to raw data prevalence.
-
-    **Why effective can differ from unweighted neg/pos:** mixing ``w_i`` with per-row token
-    counts changes the weighted token stream; compare logs to :func:`compute_pos_weight` for
-    the raw dataset ratio.
+    **Why effective can differ from raw neg/pos:** mixing ``w_i`` with per-row token counts
+    changes the weighted token stream; compare logs to ``raw_pos_weight`` for the unweighted ratio.
     """
     weights: List[float] = []
     sw_pos = sw_neg = 0.0
+    raw_pos = raw_neg = 0
     for i in tqdm(range(len(train_dataset)), desc="Sampler weights", unit="rec", leave=False):
         ex = train_dataset[i]
         n_pos, n_neg = completion_token_pos_neg_counts(ex, tokenizer, chat_template_kwargs)
@@ -456,12 +455,17 @@ def train_sampler_weights_and_effective_pos_weight(
         weights.append(w)
         sw_pos += w * n_pos
         sw_neg += w * n_neg
+        raw_pos += n_pos
+        raw_neg += n_neg
     if sw_pos <= 0:
         raise ValueError(
             "Weighted positive token mass is zero — check train data and sampler weights."
         )
-    effective = sw_neg / sw_pos
-    return weights, effective
+    if raw_pos <= 0:
+        raise ValueError(
+            "No violation completion tokens (label 1) found in dataset — cannot compute pos_weight."
+        )
+    return weights, sw_neg / sw_pos, raw_neg / raw_pos
 
 
 def debug_print_weighted_sampling_stats(

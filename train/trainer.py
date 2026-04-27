@@ -150,7 +150,8 @@ class ProbeTrainer(Trainer):
         )
         self.vllm_llm = vllm_llm
         self.probe = probe
-        self.pos_weight = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight is not None else None
+        _dtype = next(probe.model.parameters()).dtype
+        self.pos_weight = torch.tensor([pos_weight], dtype=_dtype) if pos_weight is not None else None
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
@@ -341,11 +342,14 @@ class ProbeTrainer(Trainer):
                 return (loss, empty_logits, empty_labels)
             return loss
 
-        logits = torch.cat([
-            probe_model(batch.features) if not isinstance(batch.features, list)
-            else probe_model([f.to(self.args.device) for f in batch.features])
-            for batch in feature_batches
-        ], dim=0)
+        probe_dtype = next(probe_model.parameters()).dtype
+
+        def _forward(features: torch.Tensor | list) -> torch.Tensor:
+            if isinstance(features, list):
+                return probe_model([f.to(self.args.device, dtype=probe_dtype) for f in features])
+            return probe_model(features.to(self.args.device, dtype=probe_dtype))
+
+        logits = torch.cat([_forward(batch.features) for batch in feature_batches], dim=0)
         ann_tok = torch.cat([batch.labels.to(self.args.device) for batch in feature_batches], dim=0)
 
         loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)(
@@ -524,7 +528,8 @@ class MultiProbeTrainer(ProbeTrainer):
         )
 
         self.vllm_llm = vllm_llm
-        self.pos_weight = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight is not None else None
+        _dtype = next(multi_model.parameters()).dtype
+        self.pos_weight = torch.tensor([pos_weight], dtype=_dtype) if pos_weight is not None else None
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
@@ -596,8 +601,9 @@ class MultiProbeTrainer(ProbeTrainer):
             if not feature_batches:
                 continue
 
+            probe_dtype = next(multi_probe_model.parameters()).dtype
             logits = torch.cat(
-                [multi_probe_model.forward_for_layer(layer_idx, b.features) for b in feature_batches],
+                [multi_probe_model.forward_for_layer(layer_idx, b.features.to(self.args.device, dtype=probe_dtype)) for b in feature_batches],
                 dim=0,
             )
             ann_tok = torch.cat([b.labels.to(self.args.device) for b in feature_batches], dim=0)

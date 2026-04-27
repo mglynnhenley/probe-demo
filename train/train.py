@@ -23,7 +23,6 @@ from config import TrainingConfig
 from data import (
     build_annotations_dataset_dict,
     collate_fn,
-    compute_pos_weight,
     debug_print_weighted_sampling_stats,
     summarize_token_class_balance,
     train_sampler_weights_and_effective_pos_weight,
@@ -194,13 +193,10 @@ def main(config_path: Path) -> None:
         model=probe_model_cfg,
         underlying_model=cfg.model_name,
         policy=None,
+        dtype=cfg.dtype,
     )
     probe = ValueHeadProbe(probe_cfg)
-    # Cast probe weights to match the dtype vLLM actually loaded the model in,
-    # which is the ground truth regardless of what cfg.dtype resolved to.
-    vllm_dtype = llm.llm_engine.model_config.dtype
-    probe.model = probe.model.to(vllm_dtype)
-    print(f"[probe] weights cast to {vllm_dtype} (from vLLM model config)")
+    print(f"[probe] initialised in {cfg.dtype}")
     if probe_model_cfg.model_type == "multi_layer_covseq":
         print(
             f"[probe] model_type=multi_layer_covseq, hidden_size={resolved_hidden_size}, "
@@ -285,7 +281,7 @@ def main(config_path: Path) -> None:
             f"fraction_violation={frac:.6f}, neg/pos≈{ratio_s}"
         )
 
-    sampler_weights, effective_pw = train_sampler_weights_and_effective_pos_weight(
+    sampler_weights, effective_pw, raw_pw = train_sampler_weights_and_effective_pos_weight(
         train_dataset,
         tokenizer,
         chat_template_kwargs=cfg.chat_template_kwargs,
@@ -305,13 +301,6 @@ def main(config_path: Path) -> None:
             f"[sampling] warning: {n_zero_w} train rows have zero sampler weight (never drawn); "
             f"check data.row_sampler_weight_from_example"
         )
-
-    raw_pw = compute_pos_weight(
-        train_dataset,
-        tokenizer,
-        chat_template_kwargs=cfg.chat_template_kwargs,
-        max_pos_weight=None,
-    )
     print(
         f"[class balance] dataset pos_weight (unweighted completion tokens, logging only) = {raw_pw:.4f}"
     )

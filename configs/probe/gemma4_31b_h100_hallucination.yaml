@@ -1,0 +1,56 @@
+# Profile: google/gemma-4-31B-it on one NVIDIA H100 (80GB), BF16 weights ~60GB.
+# ~20GB headroom for KV cache. Context window capped at 4096 to stay within budget.
+
+# ── Model / vLLM ───────────────────────────────────────────────────────────
+model_name: google/gemma-4-31B-it
+dtype: "auto"
+
+# 4096 is the safe ceiling on H100 80GB with this model. Raising it will OOM.
+max_model_len: 8192
+
+# Leave ~20GB for KV cache + probe connector. Do not raise above 0.88 on H100.
+gpu_memory_utilization: 0.85
+
+tensor_parallel_size: 1
+
+# Gemma 4 31B has 60 layers (0–59). Layer 45 is a well-performing mid/late choice.
+layer_idx: 45
+
+trust_remote_code: true
+
+chat_template_kwargs:
+  enable_thinking: false
+
+lora_present: false
+lora_path: output/lora_adapter/
+
+# ── Probe head ─────────────────────────────────────────────────────────────
+probe:
+  probe_model_type: covseq
+  # hidden_size: 0 # this is derived from the model config, not read from this yaml file
+  hidden_sizes: [128] # MLP hidden sizes, empty list means linear probe
+  output_size: 1
+  covseq:
+    window_size: 16
+    compressed_size: 64
+    training_metrics_interval_epochs: 1.0 # setting this to 1.0 is a good middle ground
+
+# ── Data ───────────────────────────────────────────────────────────────────
+annotations_jsonl: data/annotated.jsonl
+val_fraction: 0.1
+pos_weight: auto
+pos_weight_max: null
+
+# ── Training ───────────────────────────────────────────────────────────────
+epochs: 3
+train_batch_size: 6
+grad_accumulation_steps: 8  # effective batch size of 8 without extra memory cost
+probe_lr: 1.0e-3
+warmup_steps: 50
+max_grad_norm: 1.0
+val_interval: 200
+log_interval: 1
+checkpoint_interval: 50
+
+output_dir: output/gemma4_31b_hallucination_probe
+seed: 42

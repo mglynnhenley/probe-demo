@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -49,11 +49,13 @@ class ProbeConfig:
     underlying_model: Optional[str]  # base model this probe was trained on (optional for transfer)
     path: Optional[Path] = None  # pretrained weights; if set, loaded in ValueHeadProbe.__init__
     policy: Optional[str] = None  # natural-language policy (optional metadata)
+    dtype: Optional[torch.dtype] = None  # if set, model is initialised in this dtype
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         if self.path is not None:
             payload["path"] = str(self.path)
+        payload["dtype"] = str(self.dtype) if self.dtype is not None else None
         return payload
 
     @classmethod
@@ -61,6 +63,8 @@ class ProbeConfig:
         payload = dict(payload)
         if payload.get("path") is not None:
             payload["path"] = Path(payload["path"])
+        if payload.get("dtype") is not None:
+            payload["dtype"] = getattr(torch, payload["dtype"].replace("torch.", ""))
         model_payload = dict(payload["model"])
         model_payload["covseq"] = CovSeqConfig(**model_payload.get("covseq", {}))
         payload["model"] = ProbeModelConfig(**model_payload)
@@ -288,34 +292,38 @@ class ValueHeadProbe:
     def _build_model(self) -> nn.Module:
         model_cfg = self.cfg.model
         if model_cfg.model_type == "mlp":
-            return MLP(
+            m = MLP(
                 input_size=model_cfg.hidden_size,
                 hidden_sizes=model_cfg.hidden_sizes,
                 output_size=model_cfg.output_size,
             )
-        if model_cfg.model_type == "covseq":
+        elif model_cfg.model_type == "covseq":
             if model_cfg.covseq.window_size < 2:
                 raise ValueError("covseq.window_size must be at least 2")
-            return CovSeqModel(
+            m = CovSeqModel(
                 compressed_size=model_cfg.covseq.compressed_size,
                 input_size=model_cfg.hidden_size,
                 hidden_sizes=model_cfg.hidden_sizes,
                 output_size=model_cfg.output_size,
             )
-        if model_cfg.model_type == "multi_layer_covseq":
+        elif model_cfg.model_type == "multi_layer_covseq":
             if model_cfg.covseq.window_size < 2:
                 raise ValueError("covseq.window_size must be at least 2")
             n = len(model_cfg.layer_indices)
             if n < 2:
                 raise ValueError("multi_layer_covseq requires at least 2 layer_indices")
-            return MultiLayerCovSeqModel(
+            m = MultiLayerCovSeqModel(
                 n_layers=n,
                 compressed_size=model_cfg.covseq.compressed_size,
                 input_size=model_cfg.hidden_size,
                 hidden_sizes=model_cfg.hidden_sizes,
                 output_size=model_cfg.output_size,
             )
-        raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
+        else:
+            raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
+        if self.cfg.dtype is not None:
+            m = m.to(self.cfg.dtype)
+        return m
 
     def _validate_loaded_config(self, saved_cfg: ProbeConfig) -> None:
         current = self.cfg.model
@@ -349,12 +357,43 @@ class ValueHeadProbe:
     def load_from_state_dict(self) -> None:
         if self.cfg.path is None:
             raise ValueError("ProbeConfig.path is not set")
-        payload = torch.load(self.cfg.path, map_location="cpu")
-        if isinstance(payload, dict) and "state_dict" in payload:
-            saved_cfg_raw = payload.get("probe_config")
-            if isinstance(saved_cfg_raw, dict):
-                self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
-            state_dict = payload["state_dict"]
+        path = Path(self.cfg.path)
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file as safetensors_load
+            state_dict = safetensors_load(str(path), device="cpu")
+            # HF Trainer wraps the model in MultiProbeModel (_probes.<layer_idx>.*)
+            # or saves bare keys for single-layer ProbeTrainer. Strip any prefix
+            # that doesn't match the probe model's own parameter names.
+            own_keys = set(self.model.state_dict().keys())
+            if not own_keys.issubset(state_dict.keys()):
+                # Try stripping one level of prefix (e.g. "_probes.45.")
+                for key in list(state_dict.keys()):
+                    stripped = ".".join(key.split(".")[2:]) if key.count(".") >= 2 else key
+                    if stripped in own_keys and key not in own_keys:
+                        state_dict[stripped] = state_dict.pop(key)
+            # Drop any remaining foreign keys
+            state_dict = {k: v for k, v in state_dict.items() if k in own_keys}
         else:
-            state_dict = payload
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(payload, dict) and "state_dict" in payload:
+                saved_cfg_raw = payload.get("probe_config")
+                if isinstance(saved_cfg_raw, dict):
+                    self._validate_loaded_config(ProbeConfig.from_dict(saved_cfg_raw))
+                state_dict = payload["state_dict"]
+            else:
+                state_dict = payload
         self.model.load_state_dict(state_dict)
+
+
+class MultiProbeModel(nn.Module):
+    """Wraps multiple per-layer :class:`ValueHeadProbe` instances as a single ``nn.Module``."""
+
+    def __init__(self, probes: Dict[int, "ValueHeadProbe"]) -> None:
+        super().__init__()
+        self._probes = nn.ModuleDict({str(k): v.model for k, v in probes.items()})
+
+    def forward_for_layer(self, layer_idx: int, features: torch.Tensor) -> torch.Tensor:
+        return self._probes[str(layer_idx)](features)
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise NotImplementedError("Use forward_for_layer instead")

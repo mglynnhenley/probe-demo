@@ -23,7 +23,7 @@ _TRAIN_DIR = Path(__file__).resolve().parent.parent / "train"
 if str(_TRAIN_DIR) not in sys.path:
     sys.path.insert(0, str(_TRAIN_DIR))
 
-from models import CovSeqModel, ValueHeadProbe, ProbeConfig  # noqa: E402  (train package)
+from models import CovSeqModel, MultiLayerCovSeqModel, ValueHeadProbe, ProbeConfig  # noqa: E402  (train package)
 
 _DONE = object()
 
@@ -144,20 +144,37 @@ def resolve_inference_model_and_config(raw_probe_paths: list[str]) -> tuple[str,
 # ---------------------------------------------------------------------------
 
 def load_probe(path: str | Path) -> ValueHeadProbe:
-    """Load a ValueHeadProbe checkpoint from *path* onto CPU."""
+    """Load a ValueHeadProbe checkpoint from *path* onto CPU.
+
+    Supports both ``.bin`` (torch.save with embedded probe_config) and
+    ``.safetensors`` (HF Trainer output — requires a ``probe_config.json``
+    sidecar in the same directory).
+    """
     path = _expand_probe_checkpoint(str(path))
     if not path.is_file():
         raise FileNotFoundError(
             f"Probe weights not found at {path} (expected a file or a directory containing probe_head.bin)"
         )
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(payload, dict) and "probe_config" in payload:
-        cfg = ProbeConfig.from_dict(payload["probe_config"])
+    if path.suffix == ".safetensors":
+        cfg_path = path.parent / "probe_config.json"
+        if not cfg_path.is_file():
+            raise FileNotFoundError(
+                f"No probe_config.json sidecar found at {cfg_path}. "
+                "Save one alongside model.safetensors so the architecture can be reconstructed."
+            )
+        cfg = ProbeConfig.from_dict(json.loads(cfg_path.read_text(encoding="utf-8")))
+        probe = ValueHeadProbe(cfg)  # load_from_state_dict called inside via cfg.path=None
+        probe.cfg.path = path
+        probe.load_from_state_dict()
     else:
-        raise ValueError(f"Checkpoint at {path} has no 'probe_config' key")
-    probe = ValueHeadProbe(cfg)
-    if isinstance(payload, dict) and "state_dict" in payload:
-        probe.model.load_state_dict(payload["state_dict"])
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(payload, dict) and "probe_config" in payload:
+            cfg = ProbeConfig.from_dict(payload["probe_config"])
+        else:
+            raise ValueError(f"Checkpoint at {path} has no 'probe_config' key")
+        probe = ValueHeadProbe(cfg)
+        if isinstance(payload, dict) and "state_dict" in payload:
+            probe.model.load_state_dict(payload["state_dict"])
     probe.model.eval()
     return probe
 
@@ -166,9 +183,17 @@ def load_probe(path: str | Path) -> ValueHeadProbe:
 # Per-step probe runners
 # ---------------------------------------------------------------------------
 
+def probe_layer_ids(probe: ValueHeadProbe) -> list[int]:
+    """Return the vLLM layer indices this probe needs hidden states from."""
+    if isinstance(probe.model, MultiLayerCovSeqModel):
+        return list(probe.cfg.model.layer_indices)
+    return [probe.cfg.layer_idx]
+
+
 def _run_mlp_step(probe: ValueHeadProbe, hs: torch.Tensor) -> float:
+    probe_dtype = next(probe.model.parameters()).dtype
     with torch.no_grad():
-        logit = probe.model(hs.to(torch.float32))
+        logit = probe.model(hs.to(probe_dtype))
         return float(torch.sigmoid(logit).squeeze())
 
 
@@ -177,7 +202,8 @@ def _run_covseq_step(
     hs: torch.Tensor,
     buf: deque,
 ) -> float:
-    vec = hs.squeeze(0).to(torch.float32)
+    probe_dtype = next(probe.model.parameters()).dtype
+    vec = hs.squeeze(0).to(probe_dtype)
     buf.append(vec)
     # Use only real hidden states — training used truncated windows of length 1..T-1
     # for early tokens, never zero-padded full windows. Zero-padding causes a 1/T
@@ -188,18 +214,60 @@ def _run_covseq_step(
         return float(torch.sigmoid(logit).squeeze())
 
 
+def _run_multilayer_covseq_step(
+    probe: ValueHeadProbe,
+    hs_per_layer: dict[int, torch.Tensor],
+    bufs: dict[int, deque],
+) -> float:
+    """One decode step for MultiLayerCovSeqModel.
+
+    *hs_per_layer* maps vLLM layer index → hidden state tensor for this step.
+    *bufs* maps vLLM layer index → rolling window deque (mutated in place).
+    Returns the sigmoid score for this token.
+    """
+    probe_dtype = next(probe.model.parameters()).dtype
+    window_size = probe.cfg.model.covseq.window_size
+    layer_indices = probe.cfg.model.layer_indices
+
+    windows: list[torch.Tensor] = []
+    for layer_idx in layer_indices:
+        if layer_idx not in bufs:
+            bufs[layer_idx] = deque(maxlen=window_size)
+        vec = hs_per_layer[layer_idx].squeeze(0).to(probe_dtype)
+        bufs[layer_idx].append(vec)
+        window = torch.stack(list(bufs[layer_idx]), dim=0).unsqueeze(0)  # [1, T, d]
+        windows.append(window)
+
+    with torch.no_grad():
+        logit = probe.model(windows)
+        return float(torch.sigmoid(logit).squeeze())
+
+
 def run_probe_step(
     probe: ValueHeadProbe,
-    hs: torch.Tensor,
-    buf: deque | None,
-) -> tuple[float, deque | None]:
-    """Run one decode step through *probe*. Returns (score, updated_buf)."""
-    if isinstance(probe.model, CovSeqModel):
+    hs: torch.Tensor | dict[int, torch.Tensor],
+    buf: deque | dict[int, deque] | None,
+) -> tuple[float, deque | dict[int, deque] | None]:
+    """Run one decode step through *probe*. Returns (score, updated_buf).
+
+    For MultiLayerCovSeqModel, *hs* must be a dict mapping layer index → tensor
+    and *buf* must be a dict mapping layer index → deque (or None to initialise).
+    For single-layer probes, *hs* is a single tensor and *buf* is a single deque or None.
+    """
+    if isinstance(probe.model, MultiLayerCovSeqModel):
+        if buf is None:
+            buf = {}
+        assert isinstance(hs, dict), "MultiLayerCovSeqModel requires hs as dict[int, Tensor]"
+        score = _run_multilayer_covseq_step(probe, hs, buf)
+    elif isinstance(probe.model, CovSeqModel):
         if buf is None:
             buf = deque(maxlen=probe.cfg.model.covseq.window_size)
+        assert isinstance(hs, torch.Tensor)
         score = _run_covseq_step(probe, hs, buf)
     else:
+        assert isinstance(hs, torch.Tensor)
         score = _run_mlp_step(probe, hs)
+        buf = None
     return score, buf
 
 
@@ -235,16 +303,20 @@ class ProbeService:
         for p in startup_probe_paths:
             self._load_probe(p)
 
-        probe_layer_ids = sorted({pr.cfg.layer_idx for pr in self._probe_cache.values()})
-        if not probe_layer_ids:
+        all_layer_ids = sorted({
+            lid
+            for pr in self._probe_cache.values()
+            for lid in probe_layer_ids(pr)
+        })
+        if not all_layer_ids:
             # No probes configured; capture nothing — plain generation still works.
-            probe_layer_ids = []
+            all_layer_ids = []
 
-        print(f"[INIT] Probe layer IDs: {probe_layer_ids}", flush=True)
+        print(f"[INIT] Probe layer IDs: {all_layer_ids}", flush=True)
 
         # Plugin env vars must be set before engine start.
-        if probe_layer_ids:
-            os.environ["VLLM_PROBE_LAYER_IDS"] = ",".join(str(i) for i in probe_layer_ids)
+        if all_layer_ids:
+            os.environ["VLLM_PROBE_LAYER_IDS"] = ",".join(str(i) for i in all_layer_ids)
             os.environ["VLLM_PROBE_INCLUDE_PREFILL"] = "1"
         os.environ.setdefault("VLLM_RINGBUFFER_WARNING_INTERVAL", "180")
         os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
@@ -392,8 +464,8 @@ class ProbeService:
         async def _run():
             prev_text = ""
             step = 0
-            # Per-probe rolling buffers for CovSeqModel (keyed by layer_idx).
-            buffers: dict[int, deque | None] = {probe.cfg.layer_idx: None for _, probe in probes}
+            # Per-probe rolling buffers (None = uninitialised; dict for multi-layer).
+            buffers: dict[str, deque | dict | None] = {path: None for path, _ in probes}
             internal_req_id = None
             try:
                 async for output in self._llm.generate(
@@ -419,13 +491,18 @@ class ProbeService:
                         internal_req_id, step_hidden = await _result_bus.read_step_async(
                             req_id, step
                         )
-                        for _, probe in probes:
-                            hs = step_hidden.get(probe.cfg.layer_idx)
-                            if hs is None:
-                                continue
-                            score, buffers[probe.cfg.layer_idx] = run_probe_step(
-                                probe, hs, buffers[probe.cfg.layer_idx]
-                            )
+                        for path, probe in probes:
+                            if isinstance(probe.model, MultiLayerCovSeqModel):
+                                layer_ids = probe.cfg.model.layer_indices
+                                if any(step_hidden.get(lid) is None for lid in layer_ids):
+                                    continue
+                                hs_dict = {lid: step_hidden[lid] for lid in layer_ids}
+                                score, buffers[path] = run_probe_step(probe, hs_dict, buffers[path])
+                            else:
+                                hs = step_hidden.get(probe.cfg.layer_idx)
+                                if hs is None:
+                                    continue
+                                score, buffers[path] = run_probe_step(probe, hs, buffers[path])
                             per_layer.append((probe.cfg.layer_idx, score))
 
                     out_q.put((delta, token_index, per_layer if per_layer else None))
