@@ -16,6 +16,8 @@ POLICIES=(
   fabricated_quote
   structuring
   guaranteed_returns
+  financial_advice
+  tax_advice
 )
 
 for name in "${POLICIES[@]}"; do

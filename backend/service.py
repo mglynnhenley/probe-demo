@@ -20,6 +20,7 @@ if str(_TRAIN_DIR) not in sys.path:
     sys.path.insert(0, str(_TRAIN_DIR))
 
 from models import CovSeqModel, ValueHeadProbe, ProbeConfig  # noqa: E402  (train package)
+from utils import apply_chat_template_to_text  # noqa: E402  (train package)
 
 
 _KNOWN_ENV_VARS = {
@@ -174,13 +175,10 @@ def load_probe(path: str | Path) -> ValueHeadProbe:
             f"Probe weights not found at {path} (expected a file or a directory containing probe_head.bin)"
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(payload, dict) and "probe_config" in payload:
-        cfg = ProbeConfig.from_dict(payload["probe_config"])
-    else:
+    if not (isinstance(payload, dict) and "probe_config" in payload):
         raise ValueError(f"Checkpoint at {path} has no 'probe_config' key")
+    cfg = ProbeConfig.from_dict({**payload["probe_config"], "path": str(path)})
     probe = ValueHeadProbe(cfg)
-    if isinstance(payload, dict) and "state_dict" in payload:
-        probe.model.load_state_dict(payload["state_dict"])
     probe.model.eval()
     return probe
 
@@ -290,8 +288,10 @@ class ProbeService:
         for p in startup_probe_paths:
             self._load_probe(p)
 
-        probe_layer_ids = sorted({pr.cfg.layer_idx for pr in self._probe_cache.values()})
-        print(f"[INIT] Probe layer IDs: {probe_layer_ids}", flush=True)
+        print(
+            f"[INIT] Probe layer IDs: {sorted({pr.cfg.layer_idx for pr in self._probe_cache.values()})}",
+            flush=True,
+        )
 
         dtype_name = os.environ.get("HF_DTYPE") or tc.get("dtype")
         dtype = _resolve_dtype(dtype_name)
@@ -379,26 +379,21 @@ class ProbeService:
     # ------------------------------------------------------------------
 
     def _apply_chat_template(self, messages: list[dict]) -> str:
-        # Prepend a system prompt if the first message isn't one.
         if messages and messages[0].get("role") != "system":
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."}
             ] + list(messages)
-        return self.tokenizer.apply_chat_template(
+        return apply_chat_template_to_text(
+            self.tokenizer,
             messages,
-            tokenize=False,
+            chat_template_kwargs=self._chat_template_kwargs,
             add_generation_prompt=True,
-            **self._chat_template_kwargs,
         )
 
     @staticmethod
     def _layer_hidden_state(hidden_states: tuple[torch.Tensor, ...], layer_idx: int) -> torch.Tensor:
-        """Return the hidden state of decoder layer ``layer_idx`` (vLLM/HF backend convention).
-
-        ``output_hidden_states=True`` returns ``num_layers + 1`` tensors; index 0
-        is the embedding output and index ``i+1`` is the output of decoder layer ``i``,
-        matching :class:`HFHiddenStateExtractor` and the vLLM probe plugin's layer numbering.
-        """
+        """HF ``output_hidden_states=True`` returns ``[embeddings, layer_0_out, layer_1_out, ...]``;
+        decoder layer ``i`` is at index ``i+1``. Must match :class:`HFHiddenStateExtractor`."""
         return hidden_states[layer_idx + 1]
 
     # ------------------------------------------------------------------
@@ -466,8 +461,8 @@ class ProbeService:
                 if self._shutting_down or (cancel_event and cancel_event.is_set()):
                     break
 
-                # Forward through the just-sampled token. Its post-token hidden state
-                # is what training scored for that token (state AFTER the token).
+                # Training scored state AFTER each completion token (hs[-n_completion_tokens:]),
+                # so feed the just-sampled token forward and probe its post-token hidden state.
                 inp = torch.tensor([[next_token]], dtype=torch.long, device=self._device)
                 outputs = self.model(
                     input_ids=inp,
@@ -502,7 +497,6 @@ class ProbeService:
                 if delta:
                     yield delta, step, per_layer if per_layer else None
 
-                # Sample the next token from this step's logits.
                 step += 1
                 if step >= max_tokens:
                     break

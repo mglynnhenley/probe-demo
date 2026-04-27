@@ -1,0 +1,59 @@
+# Mac-shaped training config: Qwen2.5-0.5B-Instruct via HF transformers on MPS.
+# Swap `annotations_jsonl` per policy. Probe head itself runs on CPU; only the
+# base model uses the Mac GPU (via MPS in HFHiddenStateExtractor).
+
+# ── Model ──────────────────────────────────────────────────────────────────
+model_name: Qwen/Qwen2.5-0.5B-Instruct
+
+# auto → bfloat16 on CUDA/MPS, float32 on CPU (see train.resolve_dtype)
+dtype: auto
+
+max_model_len: 2048
+
+# Qwen2.5-0.5B has 24 layers (hidden_states index 0..24 after embedding).
+# layer_idx=10 is mid-network — enough depth for concept features, not so deep
+# that it collapses into next-token logits.
+layer_idx: 10
+
+# No LoRA for the pilot.
+lora_present: false
+
+# ── Probe head ─────────────────────────────────────────────────────────────
+probe:
+  probe_model_type: mlp
+  hidden_size: 0       # resolved from base model hidden_size=896 at runtime
+  hidden_sizes: [256]  # single MLP hidden layer — small pilot data, keep capacity modest
+  output_size: 1
+  covseq:
+    window_size: 8
+    compressed_size: 64
+    training_metrics_interval_epochs: 1.0
+
+# ── Data ───────────────────────────────────────────────────────────────────
+annotations_jsonl: data/financial_advice_annotated.jsonl
+
+val_fraction: 0.2
+
+pos_weight: auto
+pos_weight_max: null
+
+sampler_row_weight_min: 1.0
+sampler_row_weight_max: 10.0
+
+# ── Training ───────────────────────────────────────────────────────────────
+# Pilot: ~100 rows → 80 train / 20 eval at val_fraction=0.2. Favour more epochs.
+epochs: 5
+train_batch_size: 8
+grad_accumulation_steps: 1
+probe_lr: 1.0e-3
+warmup_steps: 10
+max_grad_norm: 1.0
+
+val_interval: 50
+log_interval: 5
+checkpoint_interval: 500
+
+# ── Output ─────────────────────────────────────────────────────────────────
+output_dir: output/qwen_mac_financial_advice
+
+seed: 42

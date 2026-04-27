@@ -4,10 +4,14 @@
 Reads the policy sentence (first paragraph) from each policy text file, runs
 `generate_dataset`'s inner coroutine for both in the same event loop so the
 OpenRouter calls interleave, and writes per-policy JSONL files under `data/`.
+
+Pass policy names as positional args to narrow to a subset:
+    python scripts/generate_pilot_datasets.py tipping_off financial_advice tax_advice
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -39,6 +43,8 @@ POLICIES = [
     ("fabricated_quote", REPO_ROOT / "policies" / "fabricated_quote.txt"),
     ("structuring", REPO_ROOT / "policies" / "structuring.txt"),
     ("guaranteed_returns", REPO_ROOT / "policies" / "guaranteed_returns.txt"),
+    ("financial_advice", REPO_ROOT / "policies" / "financial_advice.txt"),
+    ("tax_advice", REPO_ROOT / "policies" / "tax_advice.txt"),
 ]
 
 
@@ -68,11 +74,11 @@ async def _run_one(name: str, policy_path: Path) -> Path:
     return out
 
 
-async def _main() -> None:
-    tasks = [_run_one(name, path) for name, path in POLICIES]
+async def _main(selected: list[tuple[str, Path]]) -> None:
+    tasks = [_run_one(name, path) for name, path in selected]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     print("Done:")
-    for (name, _), r in zip(POLICIES, results):
+    for (name, _), r in zip(selected, results):
         if isinstance(r, Exception):
             print(f"  [FAIL] {name}: {type(r).__name__}: {r}")
         else:
@@ -80,5 +86,21 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "only", nargs="*",
+        help="Policy names to generate for. Default: all policies in POLICIES.",
+    )
+    args = parser.parse_args()
+
+    if args.only:
+        known = {name for name, _ in POLICIES}
+        unknown = [n for n in args.only if n not in known]
+        if unknown:
+            parser.error(f"unknown policy name(s): {unknown}; known: {sorted(known)}")
+        selected = [p for p in POLICIES if p[0] in set(args.only)]
+    else:
+        selected = POLICIES
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(_main())
+    asyncio.run(_main(selected))
