@@ -35,3 +35,4 @@ output/
 
 # unsloth compiled models
 unsloth_compiled_cache/
+.gstack/
