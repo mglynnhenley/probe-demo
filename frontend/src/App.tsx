@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_BACKEND, DEFAULT_MODEL, fetchModel, streamChat } from "./api";
+import { EscalationRail } from "./components/EscalationRail";
 import { MessageView } from "./components/MessageView";
 import { ProbePanel } from "./components/ProbePanel";
 import type { AssistantMessage, ChatMessage, DisplayMessage } from "./types";
@@ -216,6 +217,12 @@ export function App() {
       </header>
 
       <main className="main">
+        <EscalationRail
+          focusedMessage={focusedMessage}
+          activeProbe={activeProbe}
+          highlightThreshold={activeThreshold}
+        />
+
         <section className="chat">
           <div className="transcript" ref={transcriptRef}>
             {messages.length === 0 && (
