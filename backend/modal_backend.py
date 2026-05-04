@@ -61,12 +61,11 @@ if modal.is_local():
     from dotenv import load_dotenv
     load_dotenv(_REPO_ROOT / ".env")
 
-_HF_TOKEN = os.environ.get("HF_TOKEN", "")
-_HF_SECRET = (
-    modal.Secret.from_dict({"HF_TOKEN": _HF_TOKEN})
-    if _HF_TOKEN
-    else modal.Secret.from_dict({})
-)
+_SECRET = modal.Secret.from_dict({
+    k: os.environ[k]
+    for k in ("HF_TOKEN", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")
+    if os.environ.get(k)
+})
 
 # ---------------------------------------------------------------------------
 # Image
@@ -102,8 +101,9 @@ image = (
         "python-dotenv>=1.0",
     )
     .run_commands(
-        # vllm==0.18.1 brings its own torch==2.10.0, gguf, and other deps.
-        "pip install vllm==0.18.1",
+        # vllm==0.19.0 fixes the NoneType.dtype crash in _patch_config when
+        # loading Gemma 4 via the Transformers backend.
+        "pip install vllm==0.19.0",
         # transformers 5.x requires huggingface_hub>=0.27 (is_offline_mode was
         # removed). Upgrade both together so their APIs stay in sync; --no-deps
         # prevents pip from downgrading anything vllm already installed.
@@ -157,7 +157,7 @@ WEIGHTS_PATH = "/root/hf_cache"
     scaledown_window=300,
     volumes={WEIGHTS_PATH: weights_volume},
     timeout=600,
-    secrets=[_HF_SECRET],
+    secrets=[_SECRET],
     max_containers=1,
     min_containers=0,
 )

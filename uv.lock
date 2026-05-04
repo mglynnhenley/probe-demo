@@ -574,7 +574,7 @@ wheels = [
 
 [[package]]
 name = "compressed-tensors"
-version = "0.13.0"
+version = "0.15.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "loguru", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -582,9 +582,9 @@ dependencies = [
     { name = "torch", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "transformers", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/65/88dd1c58fb9d0ded51b5c86471b937a1525f91fad2211a6f051dc1ea822d/compressed_tensors-0.13.0.tar.gz", hash = "sha256:23893824d3498ea3f1a829f14a8fa85f9a5e76a34c711a038b8d7c619ca9a67c", size = 200995, upload-time = "2025-12-16T16:03:55.397Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/1b/c3c4a98ec5f2727656336f07a0c35862195c310d8eb0b2fa5b4be6848680/compressed_tensors-0.15.0.1.tar.gz", hash = "sha256:a8e93054e8a5ec49c980b09ed36c4c1249b4a8ee167920a8e461c4da26e78d99", size = 229412, upload-time = "2026-04-10T14:23:54.708Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/b5/61ac2563c62490922b603c09113a083fd74af3630ec3931e769484d6dcb5/compressed_tensors-0.13.0-py3-none-any.whl", hash = "sha256:3518799c9baf034eb642efb551db6b0537b8713d45a64fe4def26f7f8d6cabec", size = 192620, upload-time = "2025-12-16T16:03:53.041Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/52/93833dc1610e017ac5b7dcd59b8304d8ef67d1114c2d124e728a2cbbea12/compressed_tensors-0.15.0.1-py3-none-any.whl", hash = "sha256:e1b1f322e82e475715e242bad46925a304ea8e5c98b5055a15b8eb22fb6bfea9", size = 194260, upload-time = "2026-04-10T14:23:53.098Z" },
 ]
 
 [[package]]
@@ -1097,6 +1097,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/b8/00651a0f559862f3bb7d6f7477b192afe3f583cc5e26403b44e59a55ab34/filelock-3.25.2.tar.gz", hash = "sha256:b64ece2b38f4ca29dd3e810287aa8c48182bbecd1ae6e9ae126c9b35f1382694", size = 40480, upload-time = "2026-03-11T20:45:38.487Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/a5/842ae8f0c08b61d6484b52f99a03510a3a72d23141942d216ebe81fefbce/filelock-3.25.2-py3-none-any.whl", hash = "sha256:ca8afb0da15f229774c9ad1b455ed96e85a81373065fb10446672f64444ddf70", size = 26759, upload-time = "2026-03-11T20:45:37.437Z" },
+]
+
+[[package]]
+name = "flashinfer-cubin"
+version = "0.6.6"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/12/e8/826f9452bc5f76b94d7eb025f03dcaf1b51b9ed7790386c0285191e69be4/flashinfer_cubin-0.6.6-py3-none-any.whl", hash = "sha256:36508dfc792eb5ecfb15d2c140a7702812e1fa1ab0fb03929b2ed55e3e8191f3", size = 267661457, upload-time = "2026-03-11T01:36:36.538Z" },
 ]
 
 [[package]]
@@ -5223,7 +5231,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.18.1"
+version = "0.19.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -5238,6 +5246,7 @@ dependencies = [
     { name = "einops", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "fastapi", extra = ["standard"], marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "flashinfer-cubin", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-python", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "gguf", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "ijson", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -5291,15 +5300,15 @@ dependencies = [
     { name = "watchfiles", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "xgrammar", marker = "(platform_machine == 'aarch64' and sys_platform != 'emscripten' and sys_platform != 'win32') or (platform_machine == 'arm64' and sys_platform != 'emscripten' and sys_platform != 'win32') or (platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32') or (platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32') or (platform_machine == 'x86_64' and sys_platform != 'emscripten' and sys_platform != 'win32')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/67/fcf535827a07c0abce9cda362aef43c24b98e2dc661254e419cf22b5bc71/vllm-0.18.1.tar.gz", hash = "sha256:8d18eff1c4ed21eb8cf7a45a1d1b34752d5ec287e79186e451d5c2f797cacdb7", size = 30814301, upload-time = "2026-03-31T05:55:41.862Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/49/60a2a962ecbf780c8fbfd0d5548b208d654d5c4267df94d8d93883641431/vllm-0.19.1.tar.gz", hash = "sha256:9fb88ce6b50991eba41d183584f65f51d7f6015d86a42cdabf79c1c8bd5d66fa", size = 31105401, upload-time = "2026-04-18T05:50:15.143Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/5c/539cc73e98496031f53712cc3630cbf6642480e5d760fb4763068a4d4b7c/vllm-0.18.1-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:7e9e16639114760919ca86b74e8ac4be78e2593cd44ff387477e000a25ab5569", size = 385590570, upload-time = "2026-03-31T05:56:44.892Z" },
-    { url = "https://files.pythonhosted.org/packages/98/c8/dfc8a55242b5b9cf2ca0b212d443783dc934b7d7018a659bbec721ca8df4/vllm-0.18.1-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:33d6d81299dedd45dde43fef261fbad2d513ed80e7cf7e64fb5880e8cf8ea105", size = 433216393, upload-time = "2026-03-31T05:56:13.123Z" },
+    { url = "https://files.pythonhosted.org/packages/28/4c/26c426103c58ac8d98435fe63c7758a2f289b5481a08be19e9c9fe29a4c2/vllm-0.19.1-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:c8dde3c9af20f00a644e64a50ebe43948f2921bab3ffd5407d634c15836cb181", size = 385252556, upload-time = "2026-04-18T05:49:16.101Z" },
+    { url = "https://files.pythonhosted.org/packages/78/20/f41216b79c87372a9d03175f36fa1411ee61059ce8c557d2691722ea4aae/vllm-0.19.1-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:71a87f46cafab4489c69a5c5c83b870d0235e5694d8222303d460576293dc719", size = 433132101, upload-time = "2026-04-18T05:49:54.202Z" },
 ]
 
 [[package]]
 name = "vllm-probe-plugin"
-version = "0.2.4"
+version = "0.3.0"
 source = { editable = "../vllm_probe_plugin" }
 dependencies = [
     { name = "torch", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -5311,7 +5320,7 @@ dependencies = [
 requires-dist = [
     { name = "torch", specifier = ">=2.0.0" },
     { name = "torch-c-dlpack-ext", specifier = ">=0.1.5" },
-    { name = "vllm", specifier = "==0.18.1" },
+    { name = "vllm", specifier = ">=0.19.0" },
 ]
 
 [[package]]

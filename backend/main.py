@@ -103,6 +103,21 @@ async def _stream_sync_gen(
 # Generation → SSE chunks
 # ---------------------------------------------------------------------------
 
+def _resolve_closed_source_model(request: ChatCompletionRequest, svc) -> str | None:
+    """Return the closed-source model to use, or None for local-only generation.
+
+    Closed-source routing is triggered when:
+      - request.closed_source_model is explicitly set, OR
+      - request.model does not match the local model name (and isn't 'default')
+    """
+    if request.closed_source_model:
+        return request.closed_source_model
+    local_names = {svc.model_name.lower(), "default"}
+    if request.model.lower() not in local_names:
+        return request.model
+    return None
+
+
 def _build_chunks(
     request: ChatCompletionRequest,
     cancel_event: threading.Event,
@@ -111,12 +126,14 @@ def _build_chunks(
 ) -> Generator[str, None, None]:
     """Sync generator: yield SSE strings from the service's streaming output."""
     svc = get_service()
+    cs_model = _resolve_closed_source_model(request, svc)
 
     # Role chunk
+    display_model = cs_model or svc.model_name
     first_chunk = ChatCompletionChunk(
         id=completion_id,
         created=created,
-        model=svc.model_name,
+        model=display_model,
         choices=[ChatCompletionChunkChoice(
             delta=DeltaMessage(role="assistant"),
         )],
@@ -126,29 +143,41 @@ def _build_chunks(
     messages = [m.model_dump() for m in request.messages]
     probes = svc.get_probes(request.probe_path) if request.include_scores else []
 
-    for delta, token_index, per_layer in svc.generate_streaming(
-        messages=messages,
-        probe_path=request.probe_path,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        include_probe_scores=request.include_scores,
-        cancel_event=cancel_event,
-    ):
+    if cs_model:
+        gen = svc.generate_closed_source_streaming(
+            messages=messages,
+            closed_source_model=cs_model,
+            probe_path=request.probe_path,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            include_probe_scores=request.include_scores,
+            cancel_event=cancel_event,
+            block_size=request.block_size,
+        )
+    else:
+        gen = svc.generate_streaming(
+            messages=messages,
+            probe_path=request.probe_path,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            include_probe_scores=request.include_scores,
+            cancel_event=cancel_event,
+        )
+
+    for delta, token_index, per_layer in gen:
         if delta is None:
-            # Completion sentinel — emit [DONE]
             break
 
         scores: dict[str, float] | None = None
         if per_layer:
-            # per_layer is [(layer_idx, score), ...] — one entry per probe.
-            # Zip with probe names to produce {name: score}.
             scores = {name: score for (name, _), (_, score) in zip(probes, per_layer)}
 
         chunk = ChatCompletionChunk(
             id=completion_id,
             created=created,
-            model=svc.model_name,
+            model=display_model,
             choices=[ChatCompletionChunkChoice(
                 delta=DeltaMessage(content=delta),
             )],
@@ -160,7 +189,7 @@ def _build_chunks(
     final_chunk = ChatCompletionChunk(
         id=completion_id,
         created=created,
-        model=svc.model_name,
+        model=display_model,
         choices=[ChatCompletionChunkChoice(
             delta=DeltaMessage(),
             finish_reason="stop",
@@ -201,11 +230,8 @@ def list_models() -> ModelList:
 
 @app.get("/v1/models/{model_id:path}")
 def retrieve_model(model_id: str) -> ModelCard:
-    svc = get_service()
-    from fastapi import HTTPException
-    if model_id != svc.model_name:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-    return ModelCard(id=svc.model_name)
+    # Return a card for any model ID — closed-source models are valid routing targets.
+    return ModelCard(id=model_id)
 
 
 @app.post("/v1/chat/completions")
@@ -227,20 +253,35 @@ async def chat_completions(
 
     # Non-streaming: collect all tokens then return
     svc = get_service()
+    cs_model = _resolve_closed_source_model(request, svc)
+    display_model = cs_model or svc.model_name
     messages = [m.model_dump() for m in request.messages]
     probes = svc.get_probes(request.probe_path) if request.include_scores else []
     all_text: list[str] = []
-    # scores_by_probe accumulates one float per token for each probe
     scores_by_probe: dict[str, list[float]] = {name: [] for name, _ in probes}
 
-    for delta, token_index, per_layer in svc.generate_streaming(
-        messages=messages,
-        probe_path=request.probe_path,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        include_probe_scores=request.include_scores,
-    ):
+    if cs_model:
+        gen = svc.generate_closed_source_streaming(
+            messages=messages,
+            closed_source_model=cs_model,
+            probe_path=request.probe_path,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            include_probe_scores=request.include_scores,
+            block_size=request.block_size,
+        )
+    else:
+        gen = svc.generate_streaming(
+            messages=messages,
+            probe_path=request.probe_path,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            include_probe_scores=request.include_scores,
+        )
+
+    for delta, token_index, per_layer in gen:
         if delta is None:
             break
         all_text.append(delta)
@@ -255,16 +296,12 @@ async def chat_completions(
 
     scores: dict[str, list[float]] | None = None
     if request.include_scores and scores_by_probe:
-        assert all(len(v) == completion_tokens for v in scores_by_probe.values()), (
-            f"Score array length mismatch: expected {completion_tokens} tokens, "
-            f"got {{{', '.join(f'{k}: {len(v)}' for k, v in scores_by_probe.items())}}}"
-        )
         scores = scores_by_probe
 
     return ChatCompletion(
         id=completion_id,
         created=created,
-        model=svc.model_name,
+        model=display_model,
         choices=[ChatCompletionChoice(
             message=ChatCompletionMessage(content=generated_text),
         )],

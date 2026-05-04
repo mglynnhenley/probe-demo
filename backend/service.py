@@ -59,12 +59,13 @@ def _warn_suspicious_env_vars() -> None:
 # ---------------------------------------------------------------------------
 
 def _expand_probe_checkpoint(raw: str) -> Path:
-    """If *raw* is a directory, prefer ``probe_head.bin`` inside it (trainer output layout)."""
+    """If *raw* is a directory, resolve to the probe weights file inside it."""
     p = Path(raw).expanduser()
     if p.is_dir():
-        cand = p / "probe_head.bin"
-        if cand.is_file():
-            return cand
+        for name in ("probe_head.bin", "model.safetensors"):
+            cand = p / name
+            if cand.is_file():
+                return cand
     return p
 
 
@@ -251,6 +252,12 @@ def run_probe_step(
     and *buf* must be a dict mapping layer index → deque (or None to initialise).
     For single-layer probes, *hs* is a single tensor and *buf* is a single deque or None.
     """
+    probe_dtype = next(probe.model.parameters()).dtype
+    if isinstance(hs, dict):
+        hs = {k: v.to(probe_dtype) for k, v in hs.items()}
+    else:
+        hs = hs.to(probe_dtype)
+
     if isinstance(probe.model, MultiLayerCovSeqModel):
         if buf is None:
             buf = {}
@@ -520,6 +527,147 @@ class ProbeService:
             if isinstance(item, Exception):
                 raise item
             yield item
+        yield None, None, None  # completion sentinel
+
+    # ------------------------------------------------------------------
+    # Closed-source streaming — same (delta, token_index, per_layer_scores) yield
+    # contract as generate_streaming, but tokens come from an external model and are
+    # forced through the local vLLM model to extract probe scores.
+    # ------------------------------------------------------------------
+
+    def generate_closed_source_streaming(
+        self,
+        messages: list[dict],
+        closed_source_model: str,
+        probe_path: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        include_probe_scores: bool = True,
+        cancel_event: threading.Event | None = None,
+        block_size: int = 1,
+    ) -> Iterator[tuple[str | None, int | None, list[tuple[int, float]] | None]]:
+        """Sync generator with the same yield contract as generate_streaming.
+
+        Tokens come from *closed_source_model* via OpenRouter or the Anthropic API.
+        Each token is forced through the local vLLM model (allowed_token_ids=[token_id])
+        to extract a hidden-state probe score. Yields (None, None, None) as sentinel.
+        """
+        import os as _os
+        from closed_source_probe import (
+            generate_closed_source_with_probe_streaming,
+            is_anthropic_model,
+        )
+
+        openrouter_api_key = _os.environ.get("OPENROUTER_API_KEY", "")
+        openrouter_base_url = _os.environ.get(
+            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+        )
+        anthropic_api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if is_anthropic_model(closed_source_model):
+            if not anthropic_api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY is not set")
+        elif not openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+        probes = self.get_probes(probe_path) if include_probe_scores else []
+
+        # Build a run_probe_step_fn that closed_source_probe expects: (step_hidden) -> float.
+        if probes:
+            _probe_name, _probe = probes[0]
+            _buf_ref: list[Any] = [None]
+
+            def _run_probe(step_hidden: dict) -> float:
+                if isinstance(_probe.model, MultiLayerCovSeqModel):
+                    layer_ids = _probe.cfg.model.layer_indices
+                    if any(step_hidden.get(lid) is None for lid in layer_ids):
+                        return 0.0
+                    hs: Any = {lid: step_hidden[lid] for lid in layer_ids}
+                else:
+                    hs = step_hidden.get(_probe.cfg.layer_idx)
+                    if hs is None:
+                        return 0.0
+                score, _buf_ref[0] = run_probe_step(_probe, hs, _buf_ref[0])
+                return score
+        else:
+            def _run_probe(step_hidden: dict) -> float:  # type: ignore[misc]
+                return 0.0
+
+        out_q: _queue.Queue = _queue.Queue()
+
+        def _token_sink(item: dict) -> None:
+            out_q.put(("token", item["token"], item["index"]))
+
+        async def _run():
+            try:
+                async for event in generate_closed_source_with_probe_streaming(
+                    messages=messages,
+                    llm=self._llm,
+                    tokenizer=self.tokenizer,
+                    run_probe_step_fn=_run_probe,
+                    closed_source_model=closed_source_model,
+                    openrouter_api_key=openrouter_api_key,
+                    openrouter_base_url=openrouter_base_url,
+                    anthropic_api_key=anthropic_api_key,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    block_size=block_size,
+                    token_sink=_token_sink,
+                ):
+                    if self._shutting_down or (cancel_event and cancel_event.is_set()):
+                        return
+                    if event.get("probe_batch"):
+                        out_q.put(("probe_batch", event["probes"]))
+                    elif event.get("done") or event.get("error"):
+                        pass  # sentinel from _DONE handles termination
+            except Exception as exc:
+                import traceback
+                print(f"[CS_GEN] ERROR: {exc}\n{traceback.format_exc()}", flush=True)
+                out_q.put(exc)
+            finally:
+                out_q.put(_DONE)
+
+        asyncio.run_coroutine_threadsafe(_run(), self._loop)
+
+        # token events arrive before their probe_batch; buffer scores and re-attach.
+        # Since tokens always precede their batch, we emit tokens immediately with
+        # score=None, then back-fill when the batch arrives — but the OpenAI streaming
+        # protocol doesn't support back-filling. Instead we hold each token until its
+        # score is known by consuming from the queue sequentially:
+        #   token → held in pending
+        #   probe_batch → resolves held tokens, emit all at once
+        pending: list[tuple[str, int]] = []  # (delta, token_index) awaiting score
+        buffered_scores: dict[int, float] = {}
+
+        for msg in iter(out_q.get, _DONE):
+            if isinstance(msg, Exception):
+                raise msg
+            kind = msg[0]
+            if kind == "token":
+                _, delta, idx = msg
+                pending.append((delta, idx))
+            elif kind == "probe_batch":
+                _, entries = msg
+                for entry in entries:
+                    buffered_scores[entry["index"]] = entry["probe_prob"]
+                # Flush pending tokens whose scores have arrived.
+                remaining: list[tuple[str, int]] = []
+                for delta, idx in pending:
+                    score = buffered_scores.pop(idx, None)
+                    if score is not None or not include_probe_scores:
+                        per_layer: list[tuple[int, float]] | None = None
+                        if score is not None and probes:
+                            per_layer = [(probes[0][1].cfg.layer_idx, score)]
+                        yield delta, idx, per_layer
+                    else:
+                        remaining.append((delta, idx))
+                pending = remaining
+
+        # Flush any remaining tokens (no probe scores — e.g. probes disabled).
+        for delta, idx in pending:
+            yield delta, idx, None
+
         yield None, None, None  # completion sentinel
 
     # ------------------------------------------------------------------

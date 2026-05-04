@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 import time
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,12 @@ class ChatCompletionRequest(BaseModel):
     include_scores: bool = True
     # Path to a ValueHeadProbe checkpoint (.pt). Falls back to PROBE_PATH env var.
     probe_path: Optional[str] = None
+    # When set, tokens are sourced from this closed-source model (via OpenRouter or
+    # the Anthropic API) and probed through the local open-source vLLM model.
+    # Any model name other than the local model's name triggers this path.
+    closed_source_model: Optional[str] = None
+    # Number of closed-source tokens to probe concurrently (latency vs. throughput).
+    block_size: int = 1
 
 
 # ---------------------------------------------------------------------------
