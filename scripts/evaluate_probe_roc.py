@@ -512,6 +512,7 @@ def main(
             underlying_model=cfg.model_name,
             path=probe_path,
             policy=None,
+            dtype=cfg.dtype,
         )
     )
     probe.model.eval()

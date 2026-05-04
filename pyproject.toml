@@ -26,6 +26,7 @@ dependencies = [
     "unsloth>=2025.4; sys_platform == 'linux'",
     "deepspeed>=0.18.9; sys_platform == 'linux'",
     "vllm-probe-plugin; sys_platform == 'linux'",
+    "modal>=1.4.2",
 ]
 
 [tool.setuptools.packages.find]

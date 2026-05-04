@@ -342,12 +342,10 @@ class ProbeTrainer(Trainer):
                 return (loss, empty_logits, empty_labels)
             return loss
 
-        probe_dtype = next(probe_model.parameters()).dtype
-
         def _forward(features: torch.Tensor | list) -> torch.Tensor:
             if isinstance(features, list):
-                return probe_model([f.to(self.args.device, dtype=probe_dtype) for f in features])
-            return probe_model(features.to(self.args.device, dtype=probe_dtype))
+                return probe_model([f.to(self.args.device) for f in features])
+            return probe_model(features.to(self.args.device))
 
         logits = torch.cat([_forward(batch.features) for batch in feature_batches], dim=0)
         ann_tok = torch.cat([batch.labels.to(self.args.device) for batch in feature_batches], dim=0)
@@ -601,9 +599,8 @@ class MultiProbeTrainer(ProbeTrainer):
             if not feature_batches:
                 continue
 
-            probe_dtype = next(multi_probe_model.parameters()).dtype
             logits = torch.cat(
-                [multi_probe_model.forward_for_layer(layer_idx, b.features.to(self.args.device, dtype=probe_dtype)) for b in feature_batches],
+                [multi_probe_model.forward_for_layer(layer_idx, b.features.to(self.args.device)) for b in feature_batches],
                 dim=0,
             )
             ann_tok = torch.cat([b.labels.to(self.args.device) for b in feature_batches], dim=0)

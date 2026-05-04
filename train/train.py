@@ -247,6 +247,8 @@ def main(config_path: Path) -> None:
         save_steps=cfg.checkpoint_interval,
         # Probe runs on CPU; vLLM owns GPUs (transformers v5: `no_cuda` removed → `use_cpu`).
         use_cpu=True,
+        bf16=cfg.dtype == torch.bfloat16,
+        fp16=cfg.dtype == torch.float16,
         optim="adamw_torch",
         weight_decay=0.01,
         lr_scheduler_type="cosine",

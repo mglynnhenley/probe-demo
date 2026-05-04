@@ -191,9 +191,8 @@ def probe_layer_ids(probe: ValueHeadProbe) -> list[int]:
 
 
 def _run_mlp_step(probe: ValueHeadProbe, hs: torch.Tensor) -> float:
-    probe_dtype = next(probe.model.parameters()).dtype
     with torch.no_grad():
-        logit = probe.model(hs.to(probe_dtype))
+        logit = probe.model(hs)
         return float(torch.sigmoid(logit).squeeze())
 
 
@@ -202,8 +201,7 @@ def _run_covseq_step(
     hs: torch.Tensor,
     buf: deque,
 ) -> float:
-    probe_dtype = next(probe.model.parameters()).dtype
-    vec = hs.squeeze(0).to(probe_dtype)
+    vec = hs.squeeze(0)
     buf.append(vec)
     # Use only real hidden states — training used truncated windows of length 1..T-1
     # for early tokens, never zero-padded full windows. Zero-padding causes a 1/T
@@ -225,7 +223,6 @@ def _run_multilayer_covseq_step(
     *bufs* maps vLLM layer index → rolling window deque (mutated in place).
     Returns the sigmoid score for this token.
     """
-    probe_dtype = next(probe.model.parameters()).dtype
     window_size = probe.cfg.model.covseq.window_size
     layer_indices = probe.cfg.model.layer_indices
 
@@ -233,7 +230,7 @@ def _run_multilayer_covseq_step(
     for layer_idx in layer_indices:
         if layer_idx not in bufs:
             bufs[layer_idx] = deque(maxlen=window_size)
-        vec = hs_per_layer[layer_idx].squeeze(0).to(probe_dtype)
+        vec = hs_per_layer[layer_idx].squeeze(0)
         bufs[layer_idx].append(vec)
         window = torch.stack(list(bufs[layer_idx]), dim=0).unsqueeze(0)  # [1, T, d]
         windows.append(window)
