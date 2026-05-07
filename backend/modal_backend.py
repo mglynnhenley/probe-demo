@@ -1,27 +1,39 @@
 """Modal deployment for the probe-demo backend.
 
-Deploy the two probe instances from the probe-demo repo root:
+Deploy the two Gemma probe instances from the probe-demo repo root:
 
-    # Hallucination probe
+    # Hallucination probe (Gemma 31B)
     PROBE_DEMO_APP_NAME=probe-demo-hallucination \
     PROBE_PATH=output/gemma4_31b_hallucination_probe/checkpoint-200/model.safetensors \
     modal deploy backend/modal_backend.py
 
-    # Financial-advice probe
+    # Financial-advice probe (Gemma 31B)
     PROBE_DEMO_APP_NAME=probe-demo-finadvice \
     PROBE_PATH=output/gemma4_31b_probe_gemma4data/checkpoint-196/model.safetensors \
     modal deploy backend/modal_backend.py
 
+    # External probe served against a different base model (e.g. Llama 3.1 8B):
+    PROBE_DEMO_APP_NAME=probe-demo-obalcells-llama-linear \
+    PROBE_PATH=output/hf_probe/llama3_1_8b_linear/model.safetensors \
+    MODEL_NAME=meta-llama/Meta-Llama-3.1-8B-Instruct \
+    MAX_MODEL_LEN=8192 \
+    GPU_MEMORY_UTILIZATION=0.85 \
+    modal deploy backend/modal_backend.py
+
 Environment variables (read from local env at `modal deploy` time):
-  PROBE_DEMO_APP_NAME   Modal app name. Required (default: probe-demo).
-  PROBE_PATH            Path relative to probe-demo/ root to the .safetensors file. Required.
-  HF_TOKEN              HuggingFace token for gated Gemma model weights. Required.
+  PROBE_DEMO_APP_NAME       Modal app name. Default: probe-demo.
+  PROBE_PATH                Path relative to probe-demo/ root to the .safetensors file. Required.
+  MODEL_NAME                HuggingFace model id served by vLLM. Default: google/gemma-4-31B-it.
+  MAX_MODEL_LEN             vLLM max sequence length. Default: 8192.
+  GPU_MEMORY_UTILIZATION    vLLM GPU memory fraction. Default: 0.85.
+  TENSOR_PARALLEL_SIZE      vLLM TP. Default: 1.
+  HF_TOKEN                  HuggingFace token for gated weights (Gemma, Llama). Required.
 
 The probe checkpoint directory (model.safetensors + probe_config.json) is
 bundled directly into the image via add_local_dir.
 
-Gemma weights are downloaded from HuggingFace on first cold start and cached
-in a named Modal Volume so subsequent restarts skip the download.
+Base-model weights are downloaded from HuggingFace on first cold start and
+cached in a named Modal Volume so subsequent restarts skip the download.
 """
 
 from __future__ import annotations
@@ -40,6 +52,10 @@ PROBE_PATH_REL = os.environ.get(
     "PROBE_PATH",
     "output/gemma4_31b_hallucination_probe/checkpoint-200/model.safetensors",
 )
+MODEL_NAME = os.environ.get("MODEL_NAME", "google/gemma-4-31B-it")
+MAX_MODEL_LEN = os.environ.get("MAX_MODEL_LEN", "8192")
+GPU_MEMORY_UTILIZATION = os.environ.get("GPU_MEMORY_UTILIZATION", "0.85")
+TENSOR_PARALLEL_SIZE = os.environ.get("TENSOR_PARALLEL_SIZE", "1")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent  # probe-demo/
 _PROBE_ABS = _REPO_ROOT / PROBE_PATH_REL
@@ -80,13 +96,14 @@ image = (
     )
     .env({
         "PYTHONPATH": "/root/repo/backend:/root/repo/train",
-        # Baked-in inference settings for google/gemma-4-31B-it on H100.
-        "MODEL_NAME": "google/gemma-4-31B-it",
+        # Inference settings — defaults are tuned for google/gemma-4-31B-it on H100;
+        # override per deployment via env at `modal deploy` time.
+        "MODEL_NAME": MODEL_NAME,
         "PROBE_PATH": "/root/probe_checkpoint/model.safetensors",
         "DTYPE": "auto",
-        "MAX_MODEL_LEN": "8192",
-        "GPU_MEMORY_UTILIZATION": "0.85",
-        "TENSOR_PARALLEL_SIZE": "1",
+        "MAX_MODEL_LEN": MAX_MODEL_LEN,
+        "GPU_MEMORY_UTILIZATION": GPU_MEMORY_UTILIZATION,
+        "TENSOR_PARALLEL_SIZE": TENSOR_PARALLEL_SIZE,
         "TRUST_REMOTE_CODE": "1",
     })
     # Install vllm without its dependency resolver so we can override the
