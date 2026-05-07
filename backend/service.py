@@ -393,7 +393,7 @@ class ProbeService:
         dtype = os.environ.get("DTYPE") or tc.get("dtype") or "auto"
         if not isinstance(dtype, str):
             dtype = str(dtype)
-        max_model_len = int(float(os.environ.get("MAX_MODEL_LEN", tc.get("max_model_len", 32768))))
+        max_model_len = int(float(os.environ.get("MAX_MODEL_LEN", tc.get("max_model_len", 4096))))
         gpu_mem = float(os.environ.get("GPU_MEMORY_UTILIZATION", tc.get("gpu_memory_utilization", 0.9)))
         tensor_parallel_size = int(os.environ.get("TENSOR_PARALLEL_SIZE", tc.get("tensor_parallel_size", 1)))
         trust_remote_code = tc.get("trust_remote_code", True)
@@ -416,9 +416,13 @@ class ProbeService:
                 gpu_memory_utilization=gpu_mem,
                 tensor_parallel_size=tensor_parallel_size,
                 trust_remote_code=trust_remote_code,
-                enable_prefix_caching=True,
+                enable_prefix_caching=False, # necessary for analyze to have all probe values returned each time
                 enforce_eager=True, # I'm sad about this
             )
+            # the enable_prefix_caching=False could be avoided if the cache was recognised and probe values were cached and sent as well
+            # unfortunately, at the moment this does not happen (the cache is stored as KV vectors only, and no probe values are cached and sent) 
+            # because of this, turning prefix caching on means that if two prompts overlap, the probe values for overlapping tokens are never sent
+            # if you really really want to fix this, come up with some way of caching the probe values too and sending them as well. That would also fix this problem
             if chunked is not None:
                 kwargs["enable_chunked_prefill"] = bool(chunked)
             return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))

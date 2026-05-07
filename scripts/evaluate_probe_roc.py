@@ -263,7 +263,9 @@ def score_dataset(
             )
             try:
                 with torch.no_grad():
-                    logits = probe.model(feature_batch.features).squeeze(-1).detach().to("cpu", dtype=torch.float32)
+                    probe_dtype = next(probe.model.parameters()).dtype
+                    features = feature_batch.features.to(dtype=probe_dtype)
+                    logits = probe.model(features).squeeze(-1).detach().to("cpu", dtype=torch.float32)
             except Exception as exc:
                 print(
                     f"[score] batch {batch_num}/{n_batches}: failure during probe scoring "
