@@ -81,11 +81,17 @@ class ProbeCompletions:
         stream: bool = False,
         include_scores: bool = True,
         probe_path: str | None = None,
+        closed_source_model: str | None = None,
+        block_size: int | None = None,
         **kwargs: Any,
     ) -> ChatCompletionWithScores | Iterator[ChatCompletionChunkWithScores]:
-        extra = {"include_scores": include_scores}
+        extra: dict[str, Any] = {"include_scores": include_scores}
         if probe_path is not None:
             extra["probe_path"] = probe_path
+        if closed_source_model is not None:
+            extra["closed_source_model"] = closed_source_model
+        if block_size is not None:
+            extra["block_size"] = block_size
 
         if stream:
             return self._stream(extra_body=extra, **kwargs)

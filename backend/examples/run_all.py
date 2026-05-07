@@ -16,6 +16,7 @@ examples = [
     "chat_completion.py",
     "chat_streaming.py",
     "probe_scores.py",
+    "analyze.py",
 ]
 
 here = Path(__file__).parent

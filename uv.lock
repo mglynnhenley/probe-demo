@@ -3227,6 +3227,7 @@ dependencies = [
     { name = "click" },
     { name = "datasets" },
     { name = "deepspeed", marker = "sys_platform == 'linux'" },
+    { name = "fastapi", extra = ["standard"], marker = "sys_platform == 'linux'" },
     { name = "httpx" },
     { name = "matplotlib" },
     { name = "modal" },
@@ -3242,6 +3243,8 @@ dependencies = [
     { name = "transformers" },
     { name = "trl", marker = "sys_platform == 'linux'" },
     { name = "unsloth", marker = "sys_platform == 'linux'" },
+    { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'linux'" },
+    { name = "uvloop", marker = "sys_platform == 'linux'" },
     { name = "vllm-probe-plugin", marker = "sys_platform == 'linux'" },
 ]
 
@@ -3252,6 +3255,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "datasets", specifier = ">=3.0" },
     { name = "deepspeed", marker = "sys_platform == 'linux'", specifier = ">=0.18.9" },
+    { name = "fastapi", extras = ["standard"], marker = "sys_platform == 'linux'", specifier = ">=0.110.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "modal", specifier = ">=1.4.2" },
@@ -3267,6 +3271,8 @@ requires-dist = [
     { name = "transformers", marker = "sys_platform == 'linux'", specifier = ">=5.5.0" },
     { name = "trl", marker = "sys_platform == 'linux'", specifier = ">=0.17" },
     { name = "unsloth", marker = "sys_platform == 'linux'", specifier = ">=2025.4" },
+    { name = "uvicorn", extras = ["standard"], marker = "sys_platform == 'linux'", specifier = ">=0.29.0" },
+    { name = "uvloop", marker = "sys_platform == 'linux'", specifier = ">=0.17.0" },
     { name = "vllm-probe-plugin", marker = "sys_platform == 'linux'", editable = "../vllm_probe_plugin" },
 ]
 

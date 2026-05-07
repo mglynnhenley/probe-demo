@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-import numpy as np
 import torch
 from datasets import Dataset, DatasetDict
 from tqdm import tqdm

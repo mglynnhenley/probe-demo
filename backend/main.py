@@ -100,23 +100,56 @@ async def _stream_sync_gen(
 
 
 # ---------------------------------------------------------------------------
-# Generation → SSE chunks
+# Routing helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_closed_source_model(request: ChatCompletionRequest, svc) -> str | None:
-    """Return the closed-source model to use, or None for local-only generation.
+_ANALYZE_SUFFIX = "-analyze"
 
-    Closed-source routing is triggered when:
+
+def _is_analyze_request(request: ChatCompletionRequest) -> bool:
+    """True when the model name ends with '-analyze'."""
+    return request.model.endswith(_ANALYZE_SUFFIX)
+
+
+def _resolve_closed_source_model(request: ChatCompletionRequest, svc) -> str | None:
+    """Return the closed-source model to route to, or None for local generation.
+
+    Triggered when:
       - request.closed_source_model is explicitly set, OR
-      - request.model does not match the local model name (and isn't 'default')
+      - request.model is not the local model name / 'default'
     """
     if request.closed_source_model:
         return request.closed_source_model
     local_names = {svc.model_name.lower(), "default"}
-    if request.model.lower() not in local_names:
-        return request.model
+    # Strip the analyze suffix before checking — e.g. "gpt-4o-analyze" still
+    # needs to be recognised as a closed-source model name.
+    bare = request.model.lower().removesuffix(_ANALYZE_SUFFIX)
+    if bare not in local_names:
+        return request.model.removesuffix(_ANALYZE_SUFFIX) if _is_analyze_request(request) else request.model
     return None
 
+
+def _extract_analyze_text_and_prompt(request: ChatCompletionRequest) -> tuple[str, str | None]:
+    """Pull the assistant text and optional user prompt from the messages list.
+
+    Convention: the last message with role='assistant' is the text to analyze.
+    The last message with role='user' before it is the user_prompt context.
+    """
+    messages = request.messages
+    text = ""
+    user_prompt: str | None = None
+    for msg in reversed(messages):
+        if not text and msg.role == "assistant":
+            text = msg.content
+        elif text and msg.role == "user":
+            user_prompt = msg.content
+            break
+    return text, user_prompt
+
+
+# ---------------------------------------------------------------------------
+# SSE chunk builders
+# ---------------------------------------------------------------------------
 
 def _build_chunks(
     request: ChatCompletionRequest,
@@ -124,12 +157,13 @@ def _build_chunks(
     completion_id: str,
     created: int,
 ) -> Generator[str, None, None]:
-    """Sync generator: yield SSE strings from the service's streaming output."""
+    """Sync generator: yield SSE strings from the appropriate service path."""
     svc = get_service()
+    is_analyze = _is_analyze_request(request)
     cs_model = _resolve_closed_source_model(request, svc)
+    display_model = cs_model or svc.model_name
 
     # Role chunk
-    display_model = cs_model or svc.model_name
     first_chunk = ChatCompletionChunk(
         id=completion_id,
         created=created,
@@ -142,15 +176,24 @@ def _build_chunks(
 
     messages = [m.model_dump() for m in request.messages]
     probes = svc.get_probes(request.probe_path) if request.include_scores else []
+    sp = svc._to_sampling_params(request)
 
-    if cs_model:
+    if is_analyze:
+        text, user_prompt = _extract_analyze_text_and_prompt(request)
+        if not text:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail="No assistant message found to analyze")
+        gen = svc.analyze_streaming(
+            text=text,
+            user_prompt=user_prompt,
+            probe_path=request.probe_path,
+        )
+    elif cs_model:
         gen = svc.generate_closed_source_streaming(
             messages=messages,
             closed_source_model=cs_model,
             probe_path=request.probe_path,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            sampling_params=sp,
             include_probe_scores=request.include_scores,
             cancel_event=cancel_event,
             block_size=request.block_size,
@@ -159,9 +202,7 @@ def _build_chunks(
         gen = svc.generate_streaming(
             messages=messages,
             probe_path=request.probe_path,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            sampling_params=sp,
             include_probe_scores=request.include_scores,
             cancel_event=cancel_event,
         )
@@ -185,7 +226,6 @@ def _build_chunks(
         )
         yield _chunk_to_sse(chunk)
 
-    # Final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
         id=completion_id,
         created=created,
@@ -230,7 +270,7 @@ def list_models() -> ModelList:
 
 @app.get("/v1/models/{model_id:path}")
 def retrieve_model(model_id: str) -> ModelCard:
-    # Return a card for any model ID — closed-source models are valid routing targets.
+    # Accept any model ID — closed-source and analyze variants are valid routing targets.
     return ModelCard(id=model_id)
 
 
@@ -251,23 +291,34 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    # Non-streaming: collect all tokens then return
+    # Non-streaming: collect all tokens/scores then return
     svc = get_service()
+    is_analyze = _is_analyze_request(request)
     cs_model = _resolve_closed_source_model(request, svc)
     display_model = cs_model or svc.model_name
     messages = [m.model_dump() for m in request.messages]
     probes = svc.get_probes(request.probe_path) if request.include_scores else []
+    sp = svc._to_sampling_params(request)
+
     all_text: list[str] = []
     scores_by_probe: dict[str, list[float]] = {name: [] for name, _ in probes}
 
-    if cs_model:
+    if is_analyze:
+        text, user_prompt = _extract_analyze_text_and_prompt(request)
+        if not text:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail="No assistant message found to analyze")
+        gen = svc.analyze_streaming(
+            text=text,
+            user_prompt=user_prompt,
+            probe_path=request.probe_path,
+        )
+    elif cs_model:
         gen = svc.generate_closed_source_streaming(
             messages=messages,
             closed_source_model=cs_model,
             probe_path=request.probe_path,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            sampling_params=sp,
             include_probe_scores=request.include_scores,
             block_size=request.block_size,
         )
@@ -275,9 +326,7 @@ async def chat_completions(
         gen = svc.generate_streaming(
             messages=messages,
             probe_path=request.probe_path,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            sampling_params=sp,
             include_probe_scores=request.include_scores,
         )
 
@@ -290,7 +339,6 @@ async def chat_completions(
                 scores_by_probe[name].append(score)
 
     generated_text = "".join(all_text)
-
     prompt_tokens = len(svc.tokenizer.encode("".join(m.content for m in request.messages)))
     completion_tokens = len(svc.tokenizer.encode(generated_text, add_special_tokens=False))
 

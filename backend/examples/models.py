@@ -5,8 +5,6 @@ Usage:
     python models.py
 """
 
-import sys
-
 from _client import get_client
 
 client = get_client()
@@ -22,11 +20,8 @@ retrieved = client.models.retrieve(model_id)
 assert retrieved.id == model_id, f"id mismatch: {retrieved.id!r} != {model_id!r}"
 print(f"PASS  GET /v1/models/{model_id} → {retrieved.id}")
 
-# Retrieve unknown model should 404
-import openai  # noqa: E402
-try:
-    client.models.retrieve("nonexistent-model")
-    print("FAIL  GET /v1/models/nonexistent-model — expected 404, got success")
-    sys.exit(1)
-except openai.NotFoundError:
-    print("PASS  GET /v1/models/nonexistent-model → 404 as expected")
+# Any model ID is accepted (the server supports closed-source routing by model name)
+retrieved_unknown = client.models.retrieve("nonexistent-model")
+assert retrieved_unknown.id == "nonexistent-model", \
+    f"unexpected id: {retrieved_unknown.id!r}"
+print("PASS  GET /v1/models/nonexistent-model → accepted (closed-source routing supported)")

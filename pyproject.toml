@@ -26,6 +26,10 @@ dependencies = [
     "unsloth>=2025.4; sys_platform == 'linux'",
     "deepspeed>=0.18.9; sys_platform == 'linux'",
     "vllm-probe-plugin; sys_platform == 'linux'",
+    # Backend server
+    "fastapi[standard]>=0.110.0; sys_platform == 'linux'",
+    "uvicorn[standard]>=0.29.0; sys_platform == 'linux'",
+    "uvloop>=0.17.0; sys_platform == 'linux'",
     "modal>=1.4.2",
 ]
 

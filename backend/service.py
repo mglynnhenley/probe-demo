@@ -13,7 +13,10 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
+
+if TYPE_CHECKING:
+    from api.schemas import ChatCompletionRequest
 
 import torch
 import uvloop
@@ -30,11 +33,11 @@ _DONE = object()
 _KNOWN_ENV_VARS = {
     "MODEL_NAME",
     "PROBE_PATH",
-    "VLLM_DTYPE",
-    "VLLM_MAX_MODEL_LEN",
-    "VLLM_GPU_MEMORY_UTILIZATION",
-    "VLLM_TENSOR_PARALLEL_SIZE",
-    "VLLM_TRUST_REMOTE_CODE",
+    "DTYPE",
+    "MAX_MODEL_LEN",
+    "GPU_MEMORY_UTILIZATION",
+    "TENSOR_PARALLEL_SIZE",
+    "TRUST_REMOTE_CODE",
     "HF_TOKEN",
     "HOST",
     "PORT",
@@ -202,7 +205,10 @@ def _run_covseq_step(
     hs: torch.Tensor,
     buf: deque,
 ) -> float:
-    vec = hs.squeeze(0)
+    # Decode path feeds [1, hidden]; analyze path feeds [1, 1, hidden] from
+    # sliced prefill tensors. Reshape to a flat [hidden] so the stacked window
+    # is always [1, T, hidden] regardless of caller.
+    vec = hs.reshape(-1)
     buf.append(vec)
     # Use only real hidden states — training used truncated windows of length 1..T-1
     # for early tokens, never zero-padded full windows. Zero-padding causes a 1/T
@@ -231,7 +237,9 @@ def _run_multilayer_covseq_step(
     for layer_idx in layer_indices:
         if layer_idx not in bufs:
             bufs[layer_idx] = deque(maxlen=window_size)
-        vec = hs_per_layer[layer_idx].squeeze(0)
+        # Reshape to flat [hidden] — handles both [1, hidden] (decode) and
+        # [1, 1, hidden] (analyze prefill slice) inputs.
+        vec = hs_per_layer[layer_idx].reshape(-1)
         bufs[layer_idx].append(vec)
         window = torch.stack(list(bufs[layer_idx]), dim=0).unsqueeze(0)  # [1, T, d]
         windows.append(window)
@@ -273,6 +281,53 @@ def run_probe_step(
         score = _run_mlp_step(probe, hs)
         buf = None
     return score, buf
+
+
+# ---------------------------------------------------------------------------
+# Shared tokenization helpers
+# ---------------------------------------------------------------------------
+
+def apply_chat_template_str(
+    tokenizer,
+    messages: list[dict],
+    chat_template_kwargs: dict | None = None,
+) -> str:
+    """Render *messages* to a prompt string, never to token ids.
+
+    Always passes return_dict=False and tokenize=False so the return type is
+    unambiguously str regardless of the transformers version installed.
+    """
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        return_dict=False,
+        **(chat_template_kwargs or {}),
+    )
+
+
+def apply_chat_template_ids(
+    tokenizer,
+    messages: list[dict],
+    chat_template_kwargs: dict | None = None,
+) -> list[int]:
+    """Render *messages* directly to a token-id list.
+
+    Always passes return_dict=False and tokenize=True so the return type is
+    unambiguously list[int] regardless of the transformers version installed.
+    """
+    return list(tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+        **(chat_template_kwargs or {}),
+    ))
+
+
+def encode_text(tokenizer, text: str) -> list[int]:
+    """Encode *text* to token ids without adding special tokens."""
+    return list(tokenizer.encode(text, add_special_tokens=False))
 
 
 # ---------------------------------------------------------------------------
@@ -335,15 +390,15 @@ class ProbeService:
         )
         self._loop_thread.start()
 
-        dtype = os.environ.get("VLLM_DTYPE") or tc.get("dtype") or "auto"
+        dtype = os.environ.get("DTYPE") or tc.get("dtype") or "auto"
         if not isinstance(dtype, str):
             dtype = str(dtype)
-        max_model_len = int(float(os.environ.get("VLLM_MAX_MODEL_LEN", tc.get("max_model_len", 32768))))
-        gpu_mem = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", tc.get("gpu_memory_utilization", 0.9)))
-        tensor_parallel_size = int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", tc.get("tensor_parallel_size", 1)))
+        max_model_len = int(float(os.environ.get("MAX_MODEL_LEN", tc.get("max_model_len", 32768))))
+        gpu_mem = float(os.environ.get("GPU_MEMORY_UTILIZATION", tc.get("gpu_memory_utilization", 0.9)))
+        tensor_parallel_size = int(os.environ.get("TENSOR_PARALLEL_SIZE", tc.get("tensor_parallel_size", 1)))
         trust_remote_code = tc.get("trust_remote_code", True)
-        if os.environ.get("VLLM_TRUST_REMOTE_CODE") is not None:
-            trust_remote_code = os.environ["VLLM_TRUST_REMOTE_CODE"].strip().lower() in (
+        if os.environ.get("TRUST_REMOTE_CODE") is not None:
+            trust_remote_code = os.environ["TRUST_REMOTE_CODE"].strip().lower() in (
                 "1", "true", "yes",
             )
 
@@ -422,11 +477,44 @@ class ProbeService:
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."}
             ] + list(messages)
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **self._chat_template_kwargs,
+        return apply_chat_template_str(self.tokenizer, messages, self._chat_template_kwargs)
+
+    # ------------------------------------------------------------------
+    # SamplingParams builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_sampling_params(request: ChatCompletionRequest) -> Any:
+        """Translate a ChatCompletionRequest into a vllm.SamplingParams.
+
+        Only passes fields confirmed present in vLLM 0.18/0.19. Standard OpenAI
+        fields with no vLLM equivalent (user, store, metadata, stream_options,
+        response_format, top_logprobs) are accepted on the schema but not forwarded.
+        """
+        import vllm
+
+        max_tokens = request.max_completion_tokens or request.max_tokens
+
+        # OpenAI logit_bias keys are stringified token ids; vLLM wants int keys.
+        logit_bias: dict[int, float] | None = None
+        if request.logit_bias:
+            logit_bias = {int(k): v for k, v in request.logit_bias.items()}
+
+        stop = request.stop if isinstance(request.stop, list) else (
+            [request.stop] if isinstance(request.stop, str) else None
+        )
+
+        return vllm.SamplingParams(
+            n=request.n,
+            temperature=request.temperature if request.temperature > 0 else 0.0,
+            top_p=request.top_p if request.temperature > 0 else 1.0,
+            max_tokens=max_tokens,
+            stop=stop,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            seed=request.seed,
+            logprobs=request.top_logprobs if request.top_logprobs is not None else (1 if request.logprobs else None),
+            logit_bias=logit_bias,
         )
 
     # ------------------------------------------------------------------
@@ -438,9 +526,7 @@ class ProbeService:
         self,
         messages: list[dict],
         probe_path: str | None = None,
-        max_tokens: int | None = None,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        sampling_params: Any = None,
         include_probe_scores: bool = True,
         cancel_event: threading.Event | None = None,
     ) -> Iterator[tuple[str | None, int | None, list[tuple[int, float]] | None]]:
@@ -457,11 +543,8 @@ class ProbeService:
         req_id = f"gen-{uuid.uuid4().hex[:12]}"
         prompt_str = self._apply_chat_template(messages)
 
-        sampling_params = vllm.SamplingParams(
-            temperature=temperature,
-            top_p=top_p if temperature > 0 else 1.0,
-            max_tokens=max_tokens,
-        )
+        if sampling_params is None:
+            sampling_params = vllm.SamplingParams()
 
         out_q: _queue.Queue = _queue.Queue()
 
@@ -540,9 +623,7 @@ class ProbeService:
         messages: list[dict],
         closed_source_model: str,
         probe_path: str | None = None,
-        max_tokens: int | None = None,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        sampling_params: Any = None,
         include_probe_scores: bool = True,
         cancel_event: threading.Event | None = None,
         block_size: int = 1,
@@ -610,8 +691,8 @@ class ProbeService:
                     openrouter_api_key=openrouter_api_key,
                     openrouter_base_url=openrouter_base_url,
                     anthropic_api_key=anthropic_api_key,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
+                    max_tokens=sampling_params.max_tokens if sampling_params else None,
+                    temperature=sampling_params.temperature if sampling_params else 1.0,
                     block_size=block_size,
                     token_sink=_token_sink,
                 ):
@@ -669,6 +750,68 @@ class ProbeService:
             yield delta, idx, None
 
         yield None, None, None  # completion sentinel
+
+    # ------------------------------------------------------------------
+    # Analyze — prefill pass only, no generation.
+    # Takes pre-existing text (from the last assistant message), runs it
+    # through the local model as a single prefill request, and streams back
+    # per-token probe scores.  Yields (token_text, token_index, per_layer_scores)
+    # then (None, None, None) as the termination sentinel — same contract as
+    # generate_streaming so main.py can treat them identically.
+    # ------------------------------------------------------------------
+
+    def analyze_streaming(
+        self,
+        text: str,
+        user_prompt: str | None = None,
+        probe_path: str | None = None,
+        batch_size: int = 64,
+    ) -> Iterator[tuple[str | None, int | None, list[tuple[int, float]] | None]]:
+        """Sync generator: prefill *text* through the local model and stream probe scores.
+
+        Thin wrapper around :func:`analyze_probe.analyze_streaming`. Delegates all
+        prefill and scoring logic there; this method only bridges the async generator
+        to a synchronous iterator via the shared event loop and a queue.
+
+        Yields ``(token_text, token_index, [(layer_idx, score), ...])`` for each token
+        in *text*, then ``(None, None, None)`` as the termination sentinel.
+        """
+        import analyze_probe
+
+        probes = self.get_probes(probe_path)
+        if not probes:
+            raise RuntimeError(
+                "No probes loaded — PROBE_PATH must be set for analyze mode"
+            )
+
+        out_q: _queue.Queue = _queue.Queue()
+
+        async def _run():
+            try:
+                async for item in analyze_probe.analyze_streaming(
+                    text=text,
+                    llm=self._llm,
+                    tokenizer=self.tokenizer,
+                    probes=probes,
+                    chat_template_kwargs=self._chat_template_kwargs,
+                    user_prompt=user_prompt,
+                    batch_size=batch_size,
+                ):
+                    out_q.put(item)
+            except Exception as exc:
+                import traceback
+                print(f"[ANALYZE] ERROR: {exc}\n{traceback.format_exc()}", flush=True)
+                out_q.put(exc)
+            finally:
+                out_q.put(_DONE)
+
+        asyncio.run_coroutine_threadsafe(_run(), self._loop)
+
+        for item in iter(out_q.get, _DONE):
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
 
     # ------------------------------------------------------------------
 

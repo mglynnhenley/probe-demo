@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 import time
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -22,22 +22,44 @@ class ChatMessage(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ChatCompletionRequest(BaseModel):
+    # Core
     model: str
     messages: list[ChatMessage]
     stream: bool = False
-    max_tokens: Optional[int] = None
-    temperature: float = 0.7
-    top_p: float = 0.9
 
-    # Score extensions — ignored when the service has no probes loaded
+    # Sampling — all map directly to vLLM SamplingParams
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None  # OpenAI o-series alias for max_tokens
+    temperature: float = 1.0
+    top_p: float = 1.0
+    n: int = 1
+    stop: Optional[list[str] | str] = None
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    seed: Optional[int] = None
+
+    # Logprobs — OpenAI uses bool + top_logprobs int; vLLM uses a single int count
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None  # number of top tokens to return logprobs for
+
+    # Token bias — OpenAI uses str keys (stringified token ids); vLLM uses int keys
+    logit_bias: Optional[dict[str, float]] = None
+
+    # Response format — json_object maps to vLLM guided_decoding; json_schema is best-effort
+    response_format: Optional[dict[str, Any]] = None
+
+    # Fields that are accepted but have no vLLM equivalent (safe to ignore)
+    user: Optional[str] = None
+    store: Optional[bool] = None
+    metadata: Optional[dict[str, Any]] = None
+    stream_options: Optional[dict[str, Any]] = None
+
+    # Probe extensions (passed via extra_body in the OpenAI SDK)
     include_scores: bool = True
-    # Path to a ValueHeadProbe checkpoint (.pt). Falls back to PROBE_PATH env var.
     probe_path: Optional[str] = None
-    # When set, tokens are sourced from this closed-source model (via OpenRouter or
-    # the Anthropic API) and probed through the local open-source vLLM model.
-    # Any model name other than the local model's name triggers this path.
+    # Closed-source routing: if set (or if model != local model name), tokens are
+    # sourced from this model and forced through the local vLLM model for probing.
     closed_source_model: Optional[str] = None
-    # Number of closed-source tokens to probe concurrently (latency vs. throughput).
     block_size: int = 1
 
 

@@ -83,11 +83,11 @@ image = (
         # Baked-in inference settings for google/gemma-4-31B-it on H100.
         "MODEL_NAME": "google/gemma-4-31B-it",
         "PROBE_PATH": "/root/probe_checkpoint/model.safetensors",
-        "VLLM_DTYPE": "auto",
-        "VLLM_MAX_MODEL_LEN": "8192",
-        "VLLM_GPU_MEMORY_UTILIZATION": "0.85",
-        "VLLM_TENSOR_PARALLEL_SIZE": "1",
-        "VLLM_TRUST_REMOTE_CODE": "1",
+        "DTYPE": "auto",
+        "MAX_MODEL_LEN": "8192",
+        "GPU_MEMORY_UTILIZATION": "0.85",
+        "TENSOR_PARALLEL_SIZE": "1",
+        "TRUST_REMOTE_CODE": "1",
     })
     # Install vllm without its dependency resolver so we can override the
     # transformers<5 pin it carries. Gemma 4 31B requires transformers>=5.5.0
@@ -162,7 +162,7 @@ WEIGHTS_PATH = "/root/hf_cache"
     min_containers=0,
 )
 @modal.asgi_app()
-def api() -> "fastapi.FastAPI":
+def api():
     import os as _os
     # Point HuggingFace at the volume so weights survive cold starts.
     _os.environ["HF_HOME"] = WEIGHTS_PATH

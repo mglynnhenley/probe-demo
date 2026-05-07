@@ -23,7 +23,7 @@ for chunk in client.chat.completions.create(
     model="default",
     messages=[{"role": "user", "content": prompt}],
     stream=True,
-    extra_body={"include_probe_scores": True},
+    extra_body={"include_scores": True},
 ):
         delta = chunk.choices[0].delta.content if chunk.choices else None
         if delta:

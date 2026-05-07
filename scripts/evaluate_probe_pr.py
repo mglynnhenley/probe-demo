@@ -16,7 +16,7 @@ Or run the full pipeline from a config:
   uv run python scripts/evaluate_probe_pr.py configs/gemma4_31b_cluster.yaml --split eval
 """
 
-from __future__ import annotation
+from __future__ import annotations
 
 import json
 import importlib

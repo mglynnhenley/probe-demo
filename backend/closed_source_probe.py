@@ -29,6 +29,7 @@ from typing import Any, AsyncGenerator
 
 import vllm
 from vllm_probe_plugin import _result_bus
+from service import apply_chat_template_str, encode_text
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +202,8 @@ async def generate_closed_source_with_probe_streaming(
        "probe_probs", "generated_text"}
       {"error": str}
     """
-    prompt_str = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    prompt_token_ids: list[int] = list(tokenizer.encode(prompt_str, add_special_tokens=False))
+    prompt_str = apply_chat_template_str(tokenizer, messages)
+    prompt_token_ids: list[int] = encode_text(tokenizer, prompt_str)
 
     use_anthropic = is_anthropic_model(closed_source_model) and bool(anthropic_api_key)
     provider = "Anthropic" if use_anthropic else "OpenRouter"
@@ -237,6 +236,7 @@ async def generate_closed_source_with_probe_streaming(
     all_probs: list[float] = []
     current_prompt_ids: list[int] = list(prompt_token_ids)
     text_so_far = ""
+    next_token_index = 0  # monotonic — advances on every sink, immune to gather races
 
     stream_done = False
     t_start = time.monotonic()
@@ -248,7 +248,7 @@ async def generate_closed_source_with_probe_streaming(
     yield_queue: asyncio.Queue = asyncio.Queue()
 
     async def _fill_block(target_size: int) -> tuple[list[int], list[str]]:
-        nonlocal stream_done, text_so_far, t_first_cs, t_last_cs
+        nonlocal stream_done, text_so_far, t_first_cs, t_last_cs, next_token_index
         ids: list[int] = []
         texts: list[str] = []
         while len(ids) < target_size and not stream_done:
@@ -261,7 +261,7 @@ async def generate_closed_source_with_probe_streaming(
                 break
             if isinstance(item, Exception):
                 raise item
-            chunk_ids = tokenizer.encode(item, add_special_tokens=False)
+            chunk_ids = encode_text(tokenizer, item)
             now = time.monotonic()
             if t_first_cs is None and chunk_ids:
                 t_first_cs = now
@@ -270,7 +270,8 @@ async def generate_closed_source_with_probe_streaming(
             for i, tid in enumerate(chunk_ids):
                 tok_str = item if i == 0 else ""
                 text_so_far += tok_str
-                global_idx = len(all_token_ids) + len(ids)
+                global_idx = next_token_index
+                next_token_index += 1
                 tok_event = {
                     "token_id": tid,
                     "token": tok_str,
