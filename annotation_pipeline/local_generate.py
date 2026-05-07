@@ -246,6 +246,7 @@ async def _run(cfg: GenerateConfig) -> None:
             model=model_name,
             completion=completion,
             policy=policy,
+            answer=record.get("answer"),
             annotations=None,
             annotator_model=None,
         ).model_dump()

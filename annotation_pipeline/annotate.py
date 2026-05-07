@@ -47,6 +47,7 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 POLICY_SYSTEM_PROMPT = (_PROMPTS_DIR / "policy_violation.txt").read_text(encoding="utf-8").strip()
 HALLUCINATION_SYSTEM_PROMPT = (_PROMPTS_DIR / "entity_annotation.txt").read_text(encoding="utf-8").strip()
 HALLUCINATION_SYSTEM_PROMPT_NO_SEARCH = (_PROMPTS_DIR / "entity_annotation_no_search.txt").read_text(encoding="utf-8").strip()
+FACT_CHECK_SYSTEM_PROMPT = (_PROMPTS_DIR / "fact_check_against_answer.txt").read_text(encoding="utf-8").strip()
 
 _DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 _DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
@@ -92,6 +93,14 @@ def format_hallucination_user_message(question: str, completion: str) -> str:
     return (
         f"Here's the instruction:\n<instruction>{question}</instruction>\n\n"
         f"Here's the completion you'll have to fact-check:\n<completion>{completion}</completion>"
+    )
+
+
+def format_fact_check_user_message(question: str, answer: str, completion: str) -> str:
+    return (
+        f"Question:\n<question>{question}</question>\n\n"
+        f"Verified correct answer:\n<answer>{answer}</answer>\n\n"
+        f"Model completion to fact-check against the verified answer:\n<completion>{completion}</completion>"
     )
 
 

@@ -50,6 +50,7 @@ class GenerationRecord(BaseModel):
     source_dataset: str = ""
     model: str
     completion: str
-    policy: str = Field(description="Natural language policy; violations are relative to this text.")
+    policy: str = Field(default="", description="Natural language policy; violations are relative to this text.")
+    answer: Optional[str] = Field(default=None, description="Ground-truth answer for factual QA datasets.")
     annotations: Optional[list[Union[AnnotatedSpan, PolicyViolationSpan]]] = None
     annotator_model: Optional[str] = None
