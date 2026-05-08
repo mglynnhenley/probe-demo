@@ -84,6 +84,22 @@ def _split_log_history(
     return loss_data, probe_data, eval_data
 
 
+def agg_fn(vals_lst: list[float], window_size: int) -> list[float]:
+    """aggregating the entries in the vals_lst into a rolling average"""
+    # if not enough values are provided to aggregate
+    if len(vals_lst) < window_size:
+        raise ValueError(f"Warning: Could not compute a rolling average as the window size was set to {window_size} and the number of entries was too low at {len(vals_lst)}")
+    assert window_size > 0, f"The window size is not a positive integer, being set to {window_size}. What?"
+    # doubly-nested list - faster but less readable
+    # rolling_avg = [ 
+    #     sum(entries) / window_size # moving average entry
+    #     for i in range(len(vals_lst) - window_size + 1)
+    #     for entries in [vals_lst[i:i+window_size]]
+    # ]
+    rolling_avg = [sum(vals_lst[i:i+window_size]) / window_size for i in range(len(vals_lst) - window_size + 1)]
+    return rolling_avg
+
+
 def plot_metrics(
     summary: Dict[str, Any],
     loss_data: List[tuple],
@@ -93,6 +109,9 @@ def plot_metrics(
 ) -> plt.Figure:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
     fig.suptitle(title or "Training metrics", fontsize=12)
+
+    # for plots which aggregate into a moving average
+    WINDOW_SIZE = 20
 
     # --- Loss & LR ---
     ax = axes[0, 0]
@@ -116,11 +135,13 @@ def plot_metrics(
     # --- Train probe (per forward) ---
     ax = axes[0, 1]
     if probe_data:
-        steps = [x[0] for x in probe_data]
-        ax.plot(steps, [x[1] for x in probe_data], color="C0", linewidth=0.6, alpha=0.8, label="f1")
-        ax.plot(steps, [x[3] for x in probe_data], color="C1", linewidth=0.6, alpha=0.7, label="prec_viol")
-        ax.plot(steps, [x[4] for x in probe_data], color="C3", linewidth=0.6, alpha=0.7, label="tpr")
-        ax.plot(steps, [x[5] for x in probe_data], color="C4", linewidth=0.6, alpha=0.7, label="tnr")
+        steps = [x[0] for x in probe_data] # list[int]
+        # each entry will be aligned to the first step in that moving average cell
+        steps = steps[:-(WINDOW_SIZE - 1)] if WINDOW_SIZE > 1 else steps # no shift if WINDOW_SIZE=1        
+        ax.plot(steps, agg_fn([x[1] for x in probe_data], WINDOW_SIZE), color="C0", linewidth=0.6, alpha=0.8, label="f1")
+        ax.plot(steps, agg_fn([x[3] for x in probe_data], WINDOW_SIZE), color="C1", linewidth=0.6, alpha=0.7, label="prec_viol")
+        ax.plot(steps, agg_fn([x[4] for x in probe_data], WINDOW_SIZE), color="C3", linewidth=0.6, alpha=0.7, label="tpr")
+        ax.plot(steps, agg_fn([x[5] for x in probe_data], WINDOW_SIZE), color="C4", linewidth=0.6, alpha=0.7, label="tnr")
         ax.set_ylabel("score")
         ax.set_xlabel("step")
         ax.set_ylim(-0.05, 1.05)
@@ -155,7 +176,9 @@ def plot_metrics(
     ax = axes[1, 1]
     if probe_data:
         steps = [x[0] for x in probe_data]
-        ax.plot(steps, [x[6] for x in probe_data], color="purple", linewidth=0.5, alpha=0.75)
+        # each entry will be aligned to the first step in that moving average cell
+        steps = steps[:-(WINDOW_SIZE - 1)] if WINDOW_SIZE > 1 else steps # no shift if WINDOW_SIZE=1
+        ax.plot(steps, agg_fn([x[6] for x in probe_data], WINDOW_SIZE), color="purple", linewidth=0.5, alpha=0.75)
         ax.set_xlabel("step")
         ax.set_ylabel("frac_pred_viol")
         ax.set_ylim(-0.05, 1.05)
