@@ -70,11 +70,24 @@ def get_hidden_states(llm: Any, token_id_lists: List[List[int]], lora_request: L
 
 
 def build_feature_batch_metadata(
-    hidden_states_list: List[torch.Tensor],
+    hidden_states_list: List[torch.Tensor] | List[List[torch.Tensor]],
     completion_token_labels: List[torch.Tensor],
     model_cfg: Any,
 ) -> List[dict[str, torch.Tensor]]:
-    """Benchmark-only metadata aligned with ``build_probe_feature_batches`` output."""
+    """Benchmark-only metadata aligned with ``build_probe_feature_batches`` output.
+
+    For ``multi_layer_covseq``, ``hidden_states_list`` is ``List[List[Tensor]]``
+    (outer = layers, inner = sequences). Token positions and window lengths are
+    identical across layers, so the metadata is derived from the first layer
+    using the same logic as single-layer covseq.
+    """
+    if model_cfg.model_type == "multi_layer_covseq":
+        if not hidden_states_list:
+            raise ValueError("hidden_states_list must not be empty for multi_layer_covseq")
+        # Reuse covseq metadata derivation on layer 0 — windowing is layer-independent.
+        per_seq_hidden = hidden_states_list[0]
+        return _build_covseq_metadata(per_seq_hidden, completion_token_labels, model_cfg)
+
     if len(hidden_states_list) != len(completion_token_labels):
         raise ValueError(
             "hidden_states_list and completion_token_labels must have the same length"
@@ -115,6 +128,19 @@ def build_feature_batch_metadata(
 
     if model_cfg.model_type != "covseq":
         raise ValueError(f"Unknown probe model type: {model_cfg.probe_model_type!r}")
+
+    return _build_covseq_metadata(hidden_states_list, completion_token_labels, model_cfg)
+
+
+def _build_covseq_metadata(
+    hidden_states_list: List[torch.Tensor],
+    completion_token_labels: List[torch.Tensor],
+    model_cfg: Any,
+) -> List[dict[str, torch.Tensor]]:
+    if len(hidden_states_list) != len(completion_token_labels):
+        raise ValueError(
+            "hidden_states_list and completion_token_labels must have the same length"
+        )
 
     window_size = model_cfg.covseq.window_size
     example_index_buckets: dict[int, List[torch.Tensor]] = {}
@@ -258,23 +284,33 @@ def score_dataset(
             zip(feature_batches, metadata_batches),
             start=1,
         ):
+            # multi_layer_covseq: features is List[Tensor] (one per layer); take layer 0
+            # for diagnostic shape. Single-layer modes: features is a single Tensor.
+            shape_repr = (
+                tuple(feature_batch.features[0].shape)
+                if isinstance(feature_batch.features, list)
+                else tuple(feature_batch.features.shape)
+            )
             progress.set_postfix(
                 examples=len(rows),
                 min_tok=min(prompt_token_lengths),
                 max_tok=max(prompt_token_lengths),
                 bucket=f"{bucket_num}/{len(feature_batches)}",
-                bucket_shape=str(tuple(feature_batch.features.shape)),
+                bucket_shape=str(shape_repr),
                 scored_tok=n_scored_tokens,
             )
             try:
                 with torch.no_grad():
                     probe_dtype = next(probe.model.parameters()).dtype
-                    features = feature_batch.features.to(dtype=probe_dtype)
+                    if isinstance(feature_batch.features, list):
+                        features = [f.to(dtype=probe_dtype) for f in feature_batch.features]
+                    else:
+                        features = feature_batch.features.to(dtype=probe_dtype)
                     logits = probe.model(features).squeeze(-1).detach().to("cpu", dtype=torch.float32)
             except Exception as exc:
                 print(
                     f"[score] batch {batch_num}/{n_batches}: failure during probe scoring "
-                    f"for feature_shape={tuple(feature_batch.features.shape)}"
+                    f"for feature_shape={shape_repr}"
                 )
                 raise RuntimeError("Failed during probe scoring") from exc
             labels = feature_batch.labels.detach().to("cpu", dtype=torch.float32)
