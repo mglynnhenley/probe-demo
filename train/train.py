@@ -38,6 +38,7 @@ from utils import (
     resolve_gpu_counts,
     save_training_config_json,
     save_training_metrics_json,
+    count_model_parameters,
 )
 from vllm_probe_plugin import configure_llm
 from vllm_probe_plugin.utils import hidden_size_from_hf_config
@@ -249,10 +250,10 @@ def main(config_path: Path) -> None:
         per_device_eval_batch_size=cfg.train_batch_size,
         save_steps=cfg.checkpoint_interval,
         # Probe runs on CPU; vLLM owns GPUs (transformers v5: `no_cuda` removed → `use_cpu`).
-        use_cpu=True,
+        use_cpu=False, # keep the probe and data on GPU
         bf16=cfg.dtype == torch.bfloat16,
         fp16=cfg.dtype == torch.float16,
-        optim="adamw_torch",
+        optim="adamw_torch_fused",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         warmup_steps=cfg.warmup_steps,
@@ -374,6 +375,10 @@ def main(config_path: Path) -> None:
 
     print(f"Training dataset size: {len(trainer.train_dataset)}")
     print(f"Evaluation dataset size: {len(trainer.eval_dataset)}")
+
+    # getting information about the probe model size and displaying
+    total_params, trainable_params = count_model_parameters(probe.model)
+    print(f"Probe model size: {total_params:,} total parameters, {trainable_params:,} trainable parameters")
 
     trainer.train()
 

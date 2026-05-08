@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List, Sequence, Tuple, Union
 
 import torch
+import torch.nn as nn
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -303,3 +304,19 @@ def save_training_metrics_json(trainer: object, path: Path | str) -> None:
         except OSError:
             pass
         raise
+
+
+def count_model_parameters(model: nn.Module) -> tuple[int, int]:
+    """
+    counting the total and trainable parameters in a model
+
+    Args:
+        model (nn.Module): The model whose parameters are being counted
+
+    Returns:
+        Tuple[int, int]: The total parameters, followed by the trainable parameters
+    """
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+
+    return total_params, trainable_params

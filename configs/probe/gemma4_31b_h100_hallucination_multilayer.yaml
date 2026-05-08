@@ -11,8 +11,8 @@
 model_name: google/gemma-4-31B-it
 dtype: "auto"
 
-max_model_len: 4096
-gpu_memory_utilization: 0.85
+max_model_len: 1536 # under 2% of entries are longer than this in the gemma4 hallucinations dataset
+gpu_memory_utilization: 0.90
 tensor_parallel_size: 1
 
 trust_remote_code: true
@@ -36,14 +36,14 @@ probe:
     training_metrics_interval_epochs: 1.0
 
 # ── Data ───────────────────────────────────────────────────────────────────
-annotations_jsonl: data/gemma4_hallucinations/annotated.jsonl
+annotations_jsonl: data/annotated.jsonl
 val_fraction: 0.1
 pos_weight: auto
 pos_weight_max: null
 
 # ── Training ───────────────────────────────────────────────────────────────
 epochs: 3
-train_batch_size: 6
+train_batch_size: 16
 grad_accumulation_steps: 8
 probe_lr: 1.0e-3
 warmup_steps: 50
@@ -52,5 +52,5 @@ val_interval: 100
 log_interval: 1
 checkpoint_interval: 50
 
-output_dir: output/gemma4_31b_hallucination_probe_multilayer
+output_dir: output/gemma4_31b_hallucination_probe_multilayer_v2
 seed: 42

@@ -150,8 +150,12 @@ class ProbeTrainer(Trainer):
         )
         self.vllm_llm = vllm_llm
         self.probe = probe
-        _dtype = next(probe.model.parameters()).dtype
-        self.pos_weight = torch.tensor([pos_weight], dtype=_dtype) if pos_weight is not None else None
+        _param = next(probe.model.parameters())
+        self.pos_weight = (
+            torch.tensor([pos_weight], dtype=_param.dtype, device=_param.device)
+            if pos_weight is not None
+            else None
+        )
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
@@ -188,10 +192,6 @@ class ProbeTrainer(Trainer):
 
         return super().log(logs, start_time)
 
-    def _move_model_to_device(self, model: nn.Module, device: torch.device) -> nn.Module:
-        # vLLM owns GPUs; probe stays on CPU (hidden states arrive as CPU tensors).
-        return model
-
     def _get_hidden_states(self, token_id_lists: List[List[int]]) -> Dict[int, List[torch.Tensor]]:
         sampling_params = vllm.SamplingParams(n=1, temperature=0.0, max_tokens=1)
         outputs = self.vllm_llm.generate(
@@ -206,6 +206,28 @@ class ProbeTrainer(Trainer):
             for layer_id, hs in per_req.items():
                 hidden_states_dict.setdefault(layer_id, []).append(hs)
         return hidden_states_dict
+
+    def _move_hidden_states_to_device(
+        self,
+        hidden_states_dict: Dict[int, List[torch.Tensor]],
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[int, List[torch.Tensor]]:
+        """Pin and async-copy each per-sequence hidden-state tensor to ``device``.
+
+        The plugin delivers ``Dict[layer_id -> List[Tensor]]`` of CPU float16 tensors.
+        Pinning before the copy lets ``non_blocking=True`` actually overlap H2D with
+        compute; without pinning the copy silently degrades to synchronous.
+        """
+        new_hidden_states_dict: Dict[int, List[torch.Tensor]] = {}
+        for layer_id, tensor_list in hidden_states_dict.items():
+            moved: List[torch.Tensor] = []
+            for hs in tensor_list:
+                if not hs.is_pinned():
+                    hs = hs.pin_memory()
+                moved.append(hs.to(device=device, dtype=dtype, non_blocking=True))
+            new_hidden_states_dict[layer_id] = moved
+        return new_hidden_states_dict
 
     def _stash_probe_metrics_batch(self, feature_batches: List[Any]) -> None:
         if feature_batches and isinstance(feature_batches[0], list):
@@ -310,6 +332,10 @@ class ProbeTrainer(Trainer):
         )
 
         hidden_states_dict = self._get_hidden_states(prepared_batch.token_id_lists)
+        probe_dtype = next(self.probe.model.parameters()).dtype
+        hidden_states_dict = self._move_hidden_states_to_device(
+            hidden_states_dict, self.args.device, probe_dtype
+        )
         model_cfg = self.probe.cfg.model
         if model_cfg.model_type == "multi_layer_covseq":
             # Dict[layer_idx -> List[Tensor]] ordered by layer_indices
@@ -526,8 +552,12 @@ class MultiProbeTrainer(ProbeTrainer):
         )
 
         self.vllm_llm = vllm_llm
-        _dtype = next(multi_model.parameters()).dtype
-        self.pos_weight = torch.tensor([pos_weight], dtype=_dtype) if pos_weight is not None else None
+        _param = next(multi_model.parameters())
+        self.pos_weight = (
+            torch.tensor([pos_weight], dtype=_param.dtype, device=_param.device)
+            if pos_weight is not None
+            else None
+        )
         self.lora_request = lora_request
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.train_sampler_weights = train_sampler_weights
@@ -567,6 +597,10 @@ class MultiProbeTrainer(ProbeTrainer):
         )
 
         hidden_states_dict = self._get_hidden_states(prepared_batch.token_id_lists)
+        probe_dtype = next(self.model.parameters()).dtype
+        hidden_states_dict = self._move_hidden_states_to_device(
+            hidden_states_dict, self.args.device, probe_dtype
+        )
 
         # Track linear separability diagnostics using the first layer only.
         self._update_linear_r2_reservoir(

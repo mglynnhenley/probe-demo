@@ -31,6 +31,7 @@ dependencies = [
     "uvicorn[standard]>=0.29.0; sys_platform == 'linux'",
     "uvloop>=0.17.0; sys_platform == 'linux'",
     "modal>=1.4.2",
+    "jinja2>=3.1.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -38,7 +39,7 @@ where = ["."]
 
 
 [tool.uv.sources]
-vllm-probe-plugin = { path = "../vllm_probe_plugin", editable = true }
+vllm-probe-plugin = { path = "../vllm-probe-plugin", editable = true }
 
 [tool.uv]
 # Keep transformers on v5.x so the resolver does not downgrade below Gemma 4 requirements.
