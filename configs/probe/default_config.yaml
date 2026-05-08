@@ -14,9 +14,6 @@ gpu_memory_utilization: 0.75
 # Tensor parallel width this model needs; script pairs with available GPUs → (tp, dp)
 tensor_parallel_size: 1
 
-# Layer index whose hidden states the probe reads (must match plugin / training code).
-layer_idx: 30
-
 trust_remote_code: true
 
 # Optional LoRA (vLLM); probe training does not update LoRA weights
@@ -27,6 +24,10 @@ lora_path: output/lora_adapter/
 probe:
   # Train either the original per-token MLP or the covariance-pooled sequence model.
   probe_model_type: mlp
+
+  # vLLM layer indices the probe reads. mlp / covseq use exactly one;
+  # multi_layer_covseq requires at least two.
+  layer_indices: [30]
 
   # Resolved from the base model config at runtime; leave as 0 unless debugging.
   hidden_size: 0

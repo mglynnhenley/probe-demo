@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Optional, Union, get_args, get_origin, get_type_hints
 
 import torch
 import yaml
@@ -35,9 +35,6 @@ class TrainingConfig:
     enable_chunked_prefill: Optional[bool] = None
     # Tensor parallel width required for this model; combined with available GPUs → (tp, dp)
     tensor_parallel_size: int = 1
-    layer_idx: int = 30  # hidden state layer extracted by vLLM (valid range depends on model depth)
-    # If set, trains one independent probe per listed layer and overrides layer_idx.
-    layer_indices: Optional[List[int]] = None
     trust_remote_code: bool = True
     # Passed to tokenizer/processor apply_chat_template (e.g. Gemma 4: enable_thinking: false)
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)

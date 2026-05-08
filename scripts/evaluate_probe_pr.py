@@ -183,9 +183,13 @@ def _run_full_pipeline(
     major_cc = get_compute_capability() if torch.cuda.is_available() else 0
     chunked_prefill = cfg.enable_chunked_prefill if cfg.enable_chunked_prefill is not None else major_cc >= 8
 
+    if not cfg.probe.layer_indices:
+        raise ValueError(
+            "probe.layer_indices must list at least one layer in the YAML config"
+        )
     llm = configure_llm(
         model=cfg.model_name,
-        layers=[cfg.layer_idx],
+        layers=list(cfg.probe.layer_indices),
         dtype=cfg.dtype,
         max_model_len=cfg.max_model_len,
         tensor_parallel_size=tp,
@@ -219,9 +223,9 @@ def _run_full_pipeline(
         hidden_sizes=list(cfg.probe.hidden_sizes),
         output_size=cfg.probe.output_size,
         covseq=cfg.probe.covseq,
+        layer_indices=list(cfg.probe.layer_indices),
     )
     probe = ValueHeadProbe(ProbeConfig(
-        layer_idx=cfg.layer_idx,
         model=probe_model_cfg,
         underlying_model=cfg.model_name,
         path=probe_path,

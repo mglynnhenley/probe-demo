@@ -31,25 +31,50 @@ class ProbeModelConfig:
     hidden_sizes: List[int] = field(default_factory=list)
     output_size: int = 1
     covseq: CovSeqConfig = field(default_factory=CovSeqConfig)
-    # For multi_layer_covseq: list of layer indices to pool and concatenate.
-    # Empty means single-layer mode (use ProbeConfig.layer_idx).
+    # vLLM layer indices the probe reads hidden states from. Always non-empty.
+    # ``mlp`` and ``covseq`` use a single layer (``layer_indices == [layer]``);
+    # ``multi_layer_covseq`` requires at least 2 layers.
     layer_indices: List[int] = field(default_factory=list)
 
     @property
     def model_type(self) -> str:
         return self.probe_model_type.lower()
 
+    @property
+    def layer_idx(self) -> int:
+        """First layer used by this probe.
+
+        For ``mlp`` / ``covseq`` this is *the* layer the probe reads. For
+        ``multi_layer_covseq`` it is the representative tag returned alongside
+        per-token scores (the probe internally consumes all ``layer_indices``).
+        """
+        if not self.layer_indices:
+            raise ValueError("ProbeModelConfig.layer_indices is empty")
+        if self.model_type != "multi_layer_covseq" and len(self.layer_indices) != 1:
+            raise ValueError(
+                f"Single-layer probe requires exactly one entry in layer_indices, "
+                f"got {self.layer_indices!r}"
+            )
+        return self.layer_indices[0]
+
 
 @dataclass
 class ProbeConfig:
     """Everything needed to construct, save, and interpret the probe head."""
 
-    layer_idx: int
     model: ProbeModelConfig
     underlying_model: Optional[str]  # base model this probe was trained on (optional for transfer)
     path: Optional[Path] = None  # pretrained weights; if set, loaded in ValueHeadProbe.__init__
     policy: Optional[str] = None  # natural-language policy (optional metadata)
     dtype: Optional[torch.dtype] = None  # if set, model is initialised in this dtype
+
+    @property
+    def layer_indices(self) -> List[int]:
+        return self.model.layer_indices
+
+    @property
+    def layer_idx(self) -> int:
+        return self.model.layer_idx
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -61,12 +86,16 @@ class ProbeConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ProbeConfig":
         payload = dict(payload)
+        # Back-compat: older checkpoints stored layer_idx at the top level.
+        legacy_layer_idx = payload.pop("layer_idx", None)
         if payload.get("path") is not None:
             payload["path"] = Path(payload["path"])
         if payload.get("dtype") is not None:
             payload["dtype"] = getattr(torch, payload["dtype"].replace("torch.", ""))
         model_payload = dict(payload["model"])
         model_payload["covseq"] = CovSeqConfig(**model_payload.get("covseq", {}))
+        if not model_payload.get("layer_indices") and legacy_layer_idx is not None:
+            model_payload["layer_indices"] = [int(legacy_layer_idx)]
         payload["model"] = ProbeModelConfig(**model_payload)
         return cls(**payload)
 
@@ -284,20 +313,38 @@ class ValueHeadProbe:
 
     def __init__(self, cfg: ProbeConfig) -> None:
         self.cfg = cfg
-        self.layer_idx = cfg.layer_idx
+        if not cfg.model.layer_indices:
+            raise ValueError("ProbeModelConfig.layer_indices must not be empty")
         self.model = self._build_model()
         if cfg.path is not None:
             self.load_from_state_dict()
 
+    @property
+    def layer_indices(self) -> List[int]:
+        return self.cfg.model.layer_indices
+
+    @property
+    def layer_idx(self) -> int:
+        return self.cfg.model.layer_idx
+
     def _build_model(self) -> nn.Module:
         model_cfg = self.cfg.model
+        n_layers = len(model_cfg.layer_indices)
         if model_cfg.model_type == "mlp":
+            if n_layers != 1:
+                raise ValueError(
+                    f"mlp probe requires exactly one layer in layer_indices, got {model_cfg.layer_indices!r}"
+                )
             m = MLP(
                 input_size=model_cfg.hidden_size,
                 hidden_sizes=model_cfg.hidden_sizes,
                 output_size=model_cfg.output_size,
             )
         elif model_cfg.model_type == "covseq":
+            if n_layers != 1:
+                raise ValueError(
+                    f"covseq probe requires exactly one layer in layer_indices, got {model_cfg.layer_indices!r}"
+                )
             if model_cfg.covseq.window_size < 2:
                 raise ValueError("covseq.window_size must be at least 2")
             m = CovSeqModel(
@@ -309,11 +356,10 @@ class ValueHeadProbe:
         elif model_cfg.model_type == "multi_layer_covseq":
             if model_cfg.covseq.window_size < 2:
                 raise ValueError("covseq.window_size must be at least 2")
-            n = len(model_cfg.layer_indices)
-            if n < 2:
+            if n_layers < 2:
                 raise ValueError("multi_layer_covseq requires at least 2 layer_indices")
             m = MultiLayerCovSeqModel(
-                n_layers=n,
+                n_layers=n_layers,
                 compressed_size=model_cfg.covseq.compressed_size,
                 input_size=model_cfg.hidden_size,
                 hidden_sizes=model_cfg.hidden_sizes,

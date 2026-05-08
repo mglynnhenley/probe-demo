@@ -19,9 +19,6 @@ gpu_memory_utilization: 0.9
 # Single H200: one replica, no tensor parallel unless you shard across GPUs.
 tensor_parallel_size: 1 # for running on 4 V100s this tensor parallelism is needed
 
-# Gemma 4 31B dense has 60 layers (indices 0–59). Mid/late layer example:
-layer_idx: 45
-
 trust_remote_code: true
 
 # Gemma 4 IT: disable “thinking” so templates match plain user/assistant completions.
@@ -32,8 +29,11 @@ lora_present: false
 lora_path: output/lora_adapter/
 
 # ── Probe head (hidden_size is taken from the loaded model in train.py; value below is only a default) ─
-# hidden_size: 4096 # not used anywhere - overwritten
-probe_hidden_sizes: []
+probe:
+  probe_model_type: mlp
+  # Gemma 4 31B dense has 60 layers (indices 0–59). Mid/late layer example:
+  layer_indices: [45]
+  hidden_sizes: []
 
 # ── Data ───────────────────────────────────────────────────────────────────
 annotations_jsonl: data/annotated.jsonl

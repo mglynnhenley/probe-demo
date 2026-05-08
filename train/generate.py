@@ -218,13 +218,23 @@ def main(
         else major_cc >= 8
     )
 
+    if not cfg.probe.layer_indices:
+        raise ValueError(
+            "probe.layer_indices must list at least one layer in the YAML config"
+        )
+    if len(cfg.probe.layer_indices) != 1:
+        raise ValueError(
+            "generate.py extracts a single layer per file; "
+            f"probe.layer_indices must have exactly one entry, got {cfg.probe.layer_indices!r}"
+        )
+    target_layer_idx = int(cfg.probe.layer_indices[0])
     print(
-        f"Loading vLLM: model={cfg.model_name}, layer={cfg.layer_idx}, "
+        f"Loading vLLM: model={cfg.model_name}, layer={target_layer_idx}, "
         f"tp={tp}, dp={dp}, chunked_prefill={chunked_prefill}"
     )
     llm = configure_llm(
         model=cfg.model_name,
-        layers=[cfg.layer_idx],
+        layers=[target_layer_idx],
         dtype=cfg.dtype,
         max_model_len=cfg.max_model_len,
         tensor_parallel_size=tp,
@@ -300,13 +310,13 @@ def main(
         if not token_id_lists:
             continue
 
-        hidden_states_list = _generate_batch(llm, token_id_lists, cfg.layer_idx, lora_request)
+        hidden_states_list = _generate_batch(llm, token_id_lists, target_layer_idx, lora_request)
 
         for (row, h, out_path), hs, n_comp in zip(
             valid_chunk, hidden_states_list, n_completion_tokens_list
         ):
             arr = hs.cpu().to(torch.float32).numpy()
-            _save_npz_atomic(out_path, arr, n_comp, cfg.layer_idx)
+            _save_npz_atomic(out_path, arr, n_comp, target_layer_idx)
             n_saved += 1
 
     print(

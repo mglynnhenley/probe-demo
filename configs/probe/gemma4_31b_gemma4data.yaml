@@ -9,7 +9,6 @@ dtype: auto
 max_model_len: 2048
 gpu_memory_utilization: 0.9
 tensor_parallel_size: 4  # 4×V100; set to 1 for H200
-layer_idx: 45             # Gemma 4 31B has 60 layers (0–59)
 trust_remote_code: true
 
 chat_template_kwargs:
@@ -21,6 +20,7 @@ lora_path: output/lora_adapter/
 # ── Probe head ─────────────────────────────────────────────────────────────────
 probe:
   probe_model_type: covseq
+  layer_indices: [45]      # Gemma 4 31B has 60 layers (0–59)
   hidden_sizes: [128]
   output_size: 1
   covseq:

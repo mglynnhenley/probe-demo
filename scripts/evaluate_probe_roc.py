@@ -237,7 +237,12 @@ def score_dataset(
                 f"max_tokens={max(prompt_token_lengths)})"
             )
             raise RuntimeError("Failed during vLLM hidden-state generation") from exc
-        hidden_states_list = hidden_states_dict[probe.layer_idx]
+        if probe.cfg.model.model_type == "multi_layer_covseq":
+            hidden_states_list = [
+                hidden_states_dict[li] for li in probe.cfg.model.layer_indices
+            ]
+        else:
+            hidden_states_list = hidden_states_dict[probe.cfg.model.layer_idx]
         feature_batches = build_probe_feature_batches(
             hidden_states_list,
             prepared_batch.completion_token_labels,
@@ -460,9 +465,13 @@ def main(
         f"(model={cfg.model_name}, tp={tp}, dp={dp}, max_model_len={cfg.max_model_len}, "
         f"dtype={cfg.dtype}, chunked_prefill={chunked_prefill})"
     )
+    if not cfg.probe.layer_indices:
+        raise ValueError(
+            "probe.layer_indices must list at least one layer in the YAML config"
+        )
     llm = configure_llm(
         model=cfg.model_name,
-        layers=[cfg.layer_idx],
+        layers=list(cfg.probe.layer_indices),
         dtype=cfg.dtype,
         max_model_len=cfg.max_model_len,
         tensor_parallel_size=tp,
@@ -506,10 +515,10 @@ def main(
         hidden_sizes=list(cfg.probe.hidden_sizes),
         output_size=cfg.probe.output_size,
         covseq=cfg.probe.covseq,
+        layer_indices=list(cfg.probe.layer_indices),
     )
     probe = ValueHeadProbe(
         ProbeConfig(
-            layer_idx=cfg.layer_idx,
             model=probe_model_cfg,
             underlying_model=cfg.model_name,
             path=probe_path,

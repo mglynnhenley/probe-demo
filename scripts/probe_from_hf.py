@@ -84,13 +84,12 @@ def _build_probe_demo_config(
     layer_idx = int(hf_cfg["layer_idx"])
     hidden_size = int(hf_cfg["hidden_size"])
     return {
-        "layer_idx": layer_idx,
         "model": {
             "probe_model_type": "mlp",
             "hidden_size": hidden_size,
             "hidden_sizes": [],
             "output_size": 1,
-            "layer_indices": [],
+            "layer_indices": [layer_idx],
         },
         "underlying_model": base_model,
         "path": None,

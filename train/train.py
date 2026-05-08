@@ -139,7 +139,11 @@ def main(config_path: Path) -> None:
         f"chunked_prefill={chunked_prefill})"
     )
 
-    active_layers = cfg.probe.layer_indices if cfg.probe.layer_indices else [cfg.layer_idx]
+    if not cfg.probe.layer_indices:
+        raise ValueError(
+            "probe.layer_indices must list at least one layer in the YAML config"
+        )
+    active_layers = list(cfg.probe.layer_indices)
     llm = configure_llm(
         model=cfg.model_name,
         layers=active_layers,
@@ -189,7 +193,6 @@ def main(config_path: Path) -> None:
             f"overriding YAML value {cfg.probe.hidden_size}"
         )
     probe_cfg = ProbeConfig(
-        layer_idx=cfg.layer_idx,
         model=probe_model_cfg,
         underlying_model=cfg.model_name,
         policy=None,
